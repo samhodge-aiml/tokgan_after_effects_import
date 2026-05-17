@@ -1,4 +1,4 @@
-# tokgan_ae_import
+# tokgan_after_effects_import
 
 Import Tokgan ML shape data directly into Adobe After Effects as native shape
 layers, bypassing the Silhouette → Adobe Premiere/AE export round-trip used
@@ -145,7 +145,7 @@ ExtendScript quirks worth knowing about if you hack on the loader:
 ## File layout
 
 ```
-tokgan_ae_import/
+tokgan_after_effects_import/
 ├── README.md
 ├── LICENSE                                       MIT
 ├── tokgan_json_to_ae.py                          The converter
