@@ -30,13 +30,100 @@ Coordinate convention:
     AE expects them as deltas from the vertex, so we subtract.
 """
 
+import colorsys
 import json
 import os
 import sys
 
 
+# Persons whose maximum-over-time bounding-box max dimension is smaller
+# than max(comp_w, comp_h) / BACKGROUND_DIM_DIVISOR are treated as
+# background figures: by default dropped from the import; with
+# --keep-background they are imported but share one neutral-grey fill.
+BACKGROUND_DIM_DIVISOR = 20
+
+# Bump when the sidecar payload schema changes in a way the loader
+# would have to handle. Sidecars whose stored value differs from this
+# constant are rebuilt on the next run regardless of mtime, so older
+# sidecars without `color` don't quietly stay around.
+PAYLOAD_SCHEMA = 2
+
+BACKGROUND_GREY = [0.5, 0.5, 0.5]
+
+
 def round_pt(x, y, ndigits=2):
     return [round(x, ndigits), round(y, ndigits)]
+
+
+def person_id_of(obj_name, obj):
+    """Canonical int person id. Prefer obj['person_id']; fall back to
+    parsing the 'pK' prefix in the object's name."""
+    pid = obj.get("person_id")
+    if pid is not None:
+        return int(pid)
+    prefix = obj_name.split(":", 1)[0]
+    return int(prefix.lstrip("p"))
+
+
+def hue_palette(n):
+    """n evenly spaced hues at full saturation/value, as 3-float RGB
+    lists in 0..1. n==0 returns []. Hue 0 (pure red) is always present
+    when n>=1 so the single-person sample renders identically to today."""
+    if n <= 0:
+        return []
+    return [
+        [round(c, 6) for c in colorsys.hsv_to_rgb(i / n, 1.0, 1.0)]
+        for i in range(n)
+    ]
+
+
+def classify_persons(objects, width, height):
+    """Return (person_color, foreground_ids, background_ids).
+
+    person_color maps int person_id -> [r,g,b] (foreground hue or
+    BACKGROUND_GREY). foreground_ids and background_ids are sorted
+    lists of ints. Classification uses the per-person maximum across
+    all frames of max(bbox_w, bbox_h); the threshold is
+    max(width, height) / BACKGROUND_DIM_DIVISOR.
+    """
+    threshold = max(width, height) / BACKGROUND_DIM_DIVISOR
+
+    # (pid, frame) -> [minx, maxx, miny, maxy]
+    per_pf = {}
+    for obj_name, obj in objects.items():
+        pid = person_id_of(obj_name, obj)
+        for fkey, fr in obj.get("frames", {}).items():
+            pts = fr.get("points")
+            if not pts:
+                continue
+            key = (pid, int(fkey))
+            box = per_pf.get(key)
+            for p in pts:
+                x, y = p["x"], p["y"]
+                if box is None:
+                    box = [x, x, y, y]
+                    per_pf[key] = box
+                else:
+                    if x < box[0]: box[0] = x
+                    if x > box[1]: box[1] = x
+                    if y < box[2]: box[2] = y
+                    if y > box[3]: box[3] = y
+
+    max_size = {}
+    for (pid, _f), box in per_pf.items():
+        sz = max(box[1] - box[0], box[3] - box[2])
+        if sz > max_size.get(pid, 0.0):
+            max_size[pid] = sz
+
+    foreground_ids = sorted(p for p, s in max_size.items() if s >= threshold)
+    background_ids = sorted(p for p, s in max_size.items() if s < threshold)
+
+    palette = hue_palette(len(foreground_ids))
+    person_color = {pid: palette[i] for i, pid in enumerate(foreground_ids)}
+    for pid in background_ids:
+        person_color[pid] = BACKGROUND_GREY
+
+    return person_color, foreground_ids, background_ids
 
 
 def build_shape_record(obj_name, obj, height, start_frame, end_frame, fps):
@@ -240,13 +327,19 @@ LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
             inside.addProperty("ADBE Vector Shape - Group");
             inside.addProperty("ADBE Vector Graphic - Fill");
             var pathItem = null;
+            var fillItem = null;
             for (var pp = 1; pp <= inside.numProperties; pp++) {{
-                if (inside.property(pp).matchName === "ADBE Vector Shape - Group") {{
+                var mn = inside.property(pp).matchName;
+                if (mn === "ADBE Vector Shape - Group") {{
                     pathItem = inside.property(pp);
-                    break;
+                }} else if (mn === "ADBE Vector Graphic - Fill") {{
+                    fillItem = inside.property(pp);
                 }}
             }}
             var pathProp = pathItem.property("ADBE Vector Shape");
+            if (fillItem && sd.color) {{
+                fillItem.property("ADBE Vector Fill Color").setValue(sd.color);
+            }}
 
             var shapeObjs = new Array(sd.times.length);
             var scaledTimes = new Array(sd.times.length);
@@ -333,20 +426,59 @@ def main():
         action="store_true",
         help="Rebuild the sidecar data file even if it's newer than the input.",
     )
+    p.add_argument(
+        "--keep-background",
+        action="store_true",
+        help=(
+            "Import 'background' persons (max-over-time bbox dim < "
+            "max(comp_w, comp_h)/%d) as a single neutral-grey fill "
+            "instead of dropping them. Off by default to save AE "
+            "keyframe-writing time on crowded clips." % BACKGROUND_DIM_DIVISOR
+        ),
+    )
+    p.add_argument(
+        "--fps",
+        type=float,
+        default=None,
+        help=(
+            "Override the fps declared in the JSON metadata. Tokgan "
+            "exports stamp every file with fps=24 even when the source "
+            "video runs at e.g. 25 fps, which makes the shapes play "
+            "~4%% faster than the matching footage in AE. Pass the "
+            "footage's true fps (e.g. --fps 25) to fix the timing."
+        ),
+    )
     args = p.parse_args()
 
     in_path = args.input
     out_jsx = args.output or os.path.splitext(in_path)[0] + ".jsx"
     out_data = os.path.splitext(out_jsx)[0] + "_data.json"
 
-    # Skip the expensive data-file rebuild if it already exists and is at
-    # least as new as the input — only the loader template needs regenerating
-    # for iterations on the AE-side script.
+    # Reuse the sidecar only if (a) the user didn't force, (b) it's newer
+    # than the input, AND (c) it was written by a code build that produced
+    # the same payload schema. The schema check makes adding new fields
+    # (like `color`) safe — older sidecars get rebuilt automatically.
+    sidecar_schema_ok = False
+    if os.path.exists(out_data):
+        try:
+            with open(out_data) as _sf:
+                sidecar_schema_ok = json.load(_sf).get("schema") == PAYLOAD_SCHEMA
+        except (OSError, ValueError):
+            sidecar_schema_ok = False
+
+    # --fps and --keep-background change sidecar contents without changing
+    # the input file's mtime, so an mtime-only cache check would silently
+    # serve a stale sidecar that ignores the flag. Force rebuild whenever
+    # either is set.
     data_is_current = (
         not args.force
-        and os.path.exists(out_data)
+        and not args.keep_background
+        and args.fps is None
+        and sidecar_schema_ok
         and os.path.getmtime(out_data) >= os.path.getmtime(in_path)
     )
+
+    summary_extra = ""
 
     if data_is_current:
         print(f"Reusing existing data file (newer than input): {out_data}")
@@ -357,7 +489,10 @@ def main():
 
         res = data.get("resolution", [data.get("width", 2160), data.get("height", 4096)])
         width, height = int(res[0]), int(res[1])
-        fps = float(data.get("fps", 24))
+        json_fps = float(data.get("fps", 24))
+        fps = float(args.fps) if args.fps else json_fps
+        if args.fps and args.fps != json_fps:
+            print(f"  fps override: JSON says {json_fps}, using {fps}")
 
         all_frames = set()
         for obj in data["objects"].values():
@@ -368,13 +503,23 @@ def main():
         n_frames = end_frame - start_frame + 1
         duration = n_frames / fps
 
+        person_color, fg_ids, bg_ids = classify_persons(
+            data["objects"], width, height
+        )
+        bg_set = set(bg_ids)
+
         shapes = []
         for obj_name, obj in data["objects"].items():
+            pid = person_id_of(obj_name, obj)
+            if pid in bg_set and not args.keep_background:
+                continue
             rec = build_shape_record(obj_name, obj, height, start_frame, end_frame, fps)
             if rec:
+                rec["color"] = person_color[pid]
                 shapes.append(rec)
 
         payload = {
+            "schema": PAYLOAD_SCHEMA,
             "width": width,
             "height": height,
             "fps": fps,
@@ -386,6 +531,18 @@ def main():
             json.dump(payload, f, separators=(",", ":"))
 
         n_shapes = len(shapes)
+        bg_state = "kept" if args.keep_background else "dropped"
+        summary_extra = (
+            f"  Persons: {len(fg_ids)} foreground, "
+            f"{len(bg_ids)} background ({bg_state})\n"
+        )
+        if fg_ids:
+            summary_extra += "  Hues:\n"
+            for pid in fg_ids:
+                r, g, b = person_color[pid]
+                summary_extra += (
+                    f"    p{pid}: ({int(round(r*255))},{int(round(g*255))},{int(round(b*255))})\n"
+                )
 
     loader = LOADER_TEMPLATE.format(data_basename=os.path.basename(out_data))
     with open(out_jsx, "w") as f:
@@ -394,6 +551,8 @@ def main():
     print(f"Wrote {out_jsx}  ({os.path.getsize(out_jsx):,} bytes)")
     print(f"Data {out_data}  ({os.path.getsize(out_data):,} bytes)")
     print(f"  Shapes: {n_shapes}")
+    if summary_extra:
+        print(summary_extra, end="")
 
 
 if __name__ == "__main__":
