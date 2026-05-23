@@ -45,9 +45,9 @@ BACKGROUND_DIM_DIVISOR = 20
 # Bump when the sidecar payload schema changes in a way the loader
 # would have to handle. Sidecars whose stored value differs from this
 # constant are rebuilt on the next run regardless of mtime, so older
-# sidecars without `color` (v2) or `inputVideo` (v3) don't quietly
-# stay around.
-PAYLOAD_SCHEMA = 3
+# sidecars without `color` (v2), `inputVideo` (v3), or `autoRender`
+# (v4) don't quietly stay around.
+PAYLOAD_SCHEMA = 4
 
 BACKGROUND_GREY = [0.5, 0.5, 0.5]
 
@@ -215,6 +215,11 @@ LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
 // Sidecar JSON ({data_basename}) is expected next to this script.
 (function() {{
     var STEP = "init";
+    // Best-effort: silence in-script dialogs (does not affect AE's
+    // first-launch prompts — those are gated by user preferences).
+    try {{ app.beginSuppressDialogs(); }} catch (eSD) {{
+        try {{ app.beginSuppressDialogs(true); }} catch (eSD2) {{}}
+    }}
     try {{
         STEP = "locate-script";
         var scriptFile = new File($.fileName);
@@ -268,12 +273,45 @@ LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
         var compositeMode = !!data.inputVideo;
         var comp;
         if (compositeMode) {{
+            STEP = "composite-safety-checks";
+            // Refuse to run only if a *foreign* project is open — re-
+            // runs against our own previously-saved .aep are fine, even
+            // if it's dirty (a prior render() leaves the Done queue
+            // items as a project mutation, which marks the project
+            // dirty; we'll re-save at the end either way).
+            var openFile = app.project.file;
+            var isOurAep = openFile && data.aepPath &&
+                           openFile.fsName === data.aepPath;
+            if (!isOurAep) {{
+                if (app.project.dirty) {{
+                    throw new Error(
+                        "AE has unsaved changes in a foreign project. " +
+                        "Save or discard them before running tokgan_composite."
+                    );
+                }}
+                if (openFile) {{
+                    throw new Error(
+                        "AE has another project open: " + openFile.fsName +
+                        " - close it (File > Close Project) before running " +
+                        "tokgan_composite, otherwise app.project.save() would " +
+                        "relocate that project's file path."
+                    );
+                }}
+            }}
+
             STEP = "composite-comp-cleanup";
             // Remove a prior TokganComposite from re-runs so we don't pile
             // up duplicates in the project panel.
             for (var ri = app.project.numItems; ri >= 1; ri--) {{
                 var it = app.project.item(ri);
                 if (it instanceof CompItem && it.name === "TokganComposite") it.remove();
+            }}
+            // Clear any leftover render queue items (Done from prior
+            // runs or stale "Queued" entries from failed runs). After
+            // the safety checks above, the project is either fresh or
+            // our own .aep — no user queue items to preserve.
+            for (var qi = app.project.renderQueue.numItems; qi >= 1; qi--) {{
+                app.project.renderQueue.item(qi).remove();
             }}
             STEP = "composite-import-footage (" + data.inputVideo + ")";
             var footFile = new File(data.inputVideo);
@@ -430,20 +468,112 @@ LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
             }}
         }}
 
+        if (compositeMode && data.autoRender && data.outputMov) {{
+            STEP = "auto-render-queue";
+            // Auto-render: add a render queue item, pick the best
+            // available output module, and trigger render() in-process.
+            // app.project.renderQueue.render() blocks AE until done, so
+            // an AppleScript DoScript driver naturally waits for the
+            // .mov to land before returning control to the shell.
+            var rqItem = app.project.renderQueue.items.add(comp);
+            var outModule = rqItem.outputModule(1);
+
+            STEP = "auto-render-output-module-template";
+            // Try ProRes first (smaller intermediates), fall back to
+            // the Lossless template which is always present. The shell
+            // orchestrator transcodes to H.264 mp4 afterwards either way.
+            var templateUsed = null;
+            var templateCandidates = [
+                "Apple ProRes 422 HQ",
+                "ProRes 422 HQ",
+                "Apple ProRes 422",
+                "Lossless"
+            ];
+            for (var tc = 0; tc < templateCandidates.length; tc++) {{
+                try {{
+                    outModule.applyTemplate(templateCandidates[tc]);
+                    templateUsed = templateCandidates[tc];
+                    break;
+                }} catch (tplErr) {{ /* try next */ }}
+            }}
+            if (templateUsed === null) {{
+                throw new Error("No usable output module template found");
+            }}
+            $.writeln("[Tokgan] output module template: " + templateUsed);
+
+            STEP = "auto-render-output-file";
+            outModule.file = new File(data.outputMov);
+
+            STEP = "auto-render-render";
+            var tRender = (new Date()).getTime();
+            app.project.renderQueue.render();
+            var tRendered = ((new Date()).getTime() - tRender) / 1000;
+            $.writeln(
+                "[Tokgan] render done in " + tRendered.toFixed(1) + "s -> " +
+                data.outputMov
+            );
+
+            // render() marks queue items as "Done", which dirties the
+            // project. Re-save so a subsequent re-run's safety check
+            // sees a clean project (and so the .aep on disk records
+            // the completed-queue state).
+            if (data.aepPath) {{
+                STEP = "auto-render-resave-aep";
+                try {{ app.project.save(new File(data.aepPath)); }} catch (eRS) {{}}
+            }}
+        }}
+
         $.writeln(
             "[Tokgan import] " + shapes.length + " layers; " +
             "JSON parse " + tParse.toFixed(2) + "s; " +
             "AE build " + tDone.toFixed(2) + "s"
         );
+
+        // Completion marker: AE's AppleScript DoScript may or may not
+        // wait for the script to finish (it's effectively async in
+        // AE 2025), so the shell-side orchestrator polls for this
+        // file's existence instead of trusting the osascript return.
+        // Empty file = success; non-empty = error message.
+        if (data && data.markerPath) {{
+            try {{
+                var doneFile = new File(data.markerPath);
+                doneFile.encoding = "UTF-8";
+                if (doneFile.open("w")) {{ doneFile.write(""); doneFile.close(); }}
+            }} catch (eDone) {{ /* best-effort */ }}
+        }}
     }} catch (err) {{
         try {{ app.endUndoGroup(); }} catch (e2) {{}}
-        alert(
+        var failMsg = (
             "Tokgan import failed.\n" +
             "Step: " + STEP + "\n" +
             "Error: " + err.toString() + "\n" +
             "Line:  " + (err.line || "?") + "\n" +
             "File:  " + (err.fileName || "?")
         );
+        // Mirror the success-path marker write so the orchestrator
+        // doesn't time out on a script failure. Non-empty content =
+        // error; Python reads it back as the failure reason.
+        try {{
+            if (typeof data !== "undefined" && data && data.markerPath) {{
+                var errFile = new File(data.markerPath);
+                errFile.encoding = "UTF-8";
+                if (errFile.open("w")) {{ errFile.write(failMsg); errFile.close(); }}
+            }}
+        }} catch (eMarker) {{}}
+        // In auto-render mode, neither alert (would hang the
+        // AppleScript driver on a modal) nor throw (would pop an AE
+        // script-error dialog) is acceptable. The marker file written
+        // above is the canonical error channel - osascript exits
+        // cleanly and Python reads the marker content as the failure
+        // reason. In shape-only mode keep alert() for visibility.
+        var autoRunning = false;
+        try {{ autoRunning = !!(typeof data !== "undefined" && data && data.autoRender); }} catch (eg) {{}}
+        if (autoRunning) {{
+            $.writeln("[Tokgan ERROR] " + failMsg);
+            // Deliberately do not re-throw - marker file carries the error.
+        }} else {{
+            alert(failMsg);
+        }}
     }}
 }})();
 """
@@ -550,6 +680,31 @@ def main():
             "footage even when the shape data is slightly shorter."
         ),
     )
+    p.add_argument(
+        "--auto-render",
+        action="store_true",
+        help=(
+            "Composite mode only: extend the .jsx so it adds a render "
+            "queue item and triggers renderQueue.render() in-process. "
+            "Combined with --output-mov, the .jsx writes a ProRes or "
+            "Lossless intermediate to that path. The orchestrator "
+            "drives this end-to-end via osascript DoScriptFile and "
+            "then ffmpeg-transcodes to H.264 mp4. Without this flag "
+            "the .jsx still builds the comp + queue but the user has "
+            "to hit Render manually."
+        ),
+    )
+    p.add_argument(
+        "--output-mov",
+        default=None,
+        help=(
+            "Composite + --auto-render only: where the .jsx tells AE "
+            "to write the intermediate .mov (ProRes or Lossless, "
+            "depending on which output module template the install "
+            "happens to have). The orchestrator then transcodes this "
+            "to .mp4 and deletes the .mov."
+        ),
+    )
     args = p.parse_args()
 
     in_path = args.input
@@ -578,6 +733,8 @@ def main():
         and args.fps is None
         and args.input_video is None
         and args.duration is None
+        and not args.auto_render
+        and args.output_mov is None
         and sidecar_schema_ok
         and os.path.getmtime(out_data) >= os.path.getmtime(in_path)
     )
@@ -646,6 +803,18 @@ def main():
             payload["aepPath"] = os.path.abspath(
                 os.path.splitext(out_jsx)[0] + ".aep"
             )
+            if args.auto_render:
+                if not args.output_mov:
+                    sys.exit(
+                        "ERROR: --auto-render requires --output-mov PATH"
+                    )
+                payload["autoRender"] = True
+                payload["outputMov"] = os.path.abspath(args.output_mov)
+                # Marker file the orchestrator polls for, so it
+                # doesn't have to trust osascript's return semantics.
+                payload["markerPath"] = os.path.abspath(
+                    os.path.splitext(out_jsx)[0] + ".done"
+                )
 
         with open(out_data, "w") as f:
             json.dump(payload, f, separators=(",", ":"))
@@ -662,6 +831,12 @@ def main():
                 f"fps={fps} duration={duration:.3f}s "
                 f"shutter={args.shutter_angle}/{args.shutter_phase}\n"
             )
+            if args.auto_render:
+                summary_extra += (
+                    f"  Auto-render: ON -> "
+                    f"{os.path.basename(args.output_mov)} "
+                    f"(via in-script renderQueue.render())\n"
+                )
         if fg_ids:
             summary_extra += "  Hues:\n"
             for pid in fg_ids:
