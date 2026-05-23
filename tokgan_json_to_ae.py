@@ -132,10 +132,19 @@ def build_shape_record(obj_name, obj, height, start_frame, end_frame, fps):
 
     JSON coords are screen-style (Y-down, origin top-left) — same as AE —
     despite an upstream docstring claiming Nuke convention. No Y flip.
+
+    Frames whose index is outside [start_frame, end_frame] are dropped.
+    This lets the caller cap a Tokgan JSON that happens to be one frame
+    longer than the source video — the shape data must end on the same
+    frame the footage does, or the composite layers visibly desync at
+    the tail.
     """
     times, verts_all, in_all, out_all = [], [], [], []
     path_frames = []  # source frame numbers that produced a key
     for fkey in sorted(obj.get("frames", {}).keys(), key=int):
+        fi = int(fkey)
+        if fi < start_frame or fi > end_frame:
+            continue
         pts = obj["frames"][fkey].get("points", [])
         if not pts:
             continue
@@ -164,7 +173,10 @@ def build_shape_record(obj_name, obj, height, start_frame, end_frame, fps):
     # segment emits four hold-stepped keys so AE shows a clean on/off step.
     visibility = obj.get("visibility", {})
     if visibility:
-        exists = sorted(int(k) for k, v in visibility.items() if v)
+        exists = sorted(
+            int(k) for k, v in visibility.items()
+            if v and start_frame <= int(k) <= end_frame
+        )
     else:
         exists = list(path_frames)
 
@@ -185,12 +197,18 @@ def build_shape_record(obj_name, obj, height, start_frame, end_frame, fps):
             return round((frame - start_frame) / fps, 6)
 
         raw = []
-        for seg_start, seg_end in segments:
+        for idx, (seg_start, seg_end) in enumerate(segments):
             if seg_start > start_frame:
                 raw.append((_t(seg_start - 1), 0))
             raw.append((_t(seg_start), 100))
             raw.append((_t(seg_end), 100))
-            if seg_end < end_frame:
+            # Trailing off-frame only emitted for non-final segments
+            # (gap between segments). The final segment's shape holds
+            # opacity 100 through the end of the comp so the shape
+            # doesn't blink off one frame before the footage ends
+            # when its Tokgan tracking ran short by a frame.
+            is_final = (idx == len(segments) - 1)
+            if not is_final and seg_end < end_frame:
                 raw.append((_t(seg_end + 1), 0))
         if segments[0][0] > start_frame and not any(t == 0.0 for t, _ in raw):
             raw.append((0.0, 0))
@@ -274,28 +292,43 @@ LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
         var comp;
         if (compositeMode) {{
             STEP = "composite-safety-checks";
-            // Refuse to run only if a *foreign* project is open — re-
-            // runs against our own previously-saved .aep are fine, even
-            // if it's dirty (a prior render() leaves the Done queue
-            // items as a project mutation, which marks the project
-            // dirty; we'll re-save at the end either way).
+            // Permitted starting states for composite-mode:
+            //   (a) fresh AE (no project open)
+            //   (b) our own .aep already open (re-run on same clip)
+            //   (c) some *other* __composite.aep open from a prior batch
+            //       iteration — close it silently and proceed
+            // Anything else (foreign project, dirty work) is bailed
+            // with a clear error so we never relocate the user's
+            // saved file path via app.project.save(newPath).
             var openFile = app.project.file;
             var isOurAep = openFile && data.aepPath &&
                            openFile.fsName === data.aepPath;
+            var isPriorComposite = openFile &&
+                /__composite\.aep$/i.test(openFile.name);
             if (!isOurAep) {{
-                if (app.project.dirty) {{
+                if (app.project.dirty && !isPriorComposite) {{
                     throw new Error(
                         "AE has unsaved changes in a foreign project. " +
                         "Save or discard them before running tokgan_composite."
                     );
                 }}
-                if (openFile) {{
+                if (openFile && !isPriorComposite) {{
                     throw new Error(
                         "AE has another project open: " + openFile.fsName +
                         " - close it (File > Close Project) before running " +
                         "tokgan_composite, otherwise app.project.save() would " +
                         "relocate that project's file path."
                     );
+                }}
+                if (isPriorComposite) {{
+                    // Silent close — the prior composite was re-saved at
+                    // the end of its own run, so we discard any in-memory
+                    // changes since (none, typically).
+                    try {{
+                        app.project.close(CloseOptions.DO_NOT_SAVE_CHANGES);
+                    }} catch (eClose) {{
+                        $.writeln("[Tokgan] couldn't close prior composite: " + eClose.toString());
+                    }}
                 }}
             }}
 
@@ -504,6 +537,29 @@ LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
             STEP = "auto-render-output-file";
             outModule.file = new File(data.outputMov);
 
+            if (typeof data.nbFrames === "number" && data.nbFrames > 0) {{
+                STEP = "auto-render-time-span";
+                // Render ONE extra frame past the user-visible target.
+                // ffmpeg trims it in the transcode step. Rationale:
+                // motion blur on AE's last rendered frame samples the
+                // exposure window [t-0.5/fps, t+0.5/fps]; the post-
+                // frame half needs a "future" keyframe to interpolate
+                // against, otherwise the shape (and footage) freeze
+                // for the back half of the window, producing weak /
+                // asymmetric blur on the final frame. By rendering
+                // N+1 frames and trimming the last in transcode, the
+                // surviving N frames each have proper bidirectional
+                // motion-blur sampling.
+                rqItem.timeSpanStart = 0;
+                rqItem.timeSpanDuration = (data.nbFrames + 1) / comp.frameRate;
+                $.writeln(
+                    "[Tokgan] timeSpan set to " +
+                    rqItem.timeSpanDuration.toFixed(6) +
+                    "s (render " + (data.nbFrames + 1) +
+                    " frames, ffmpeg will trim to " + data.nbFrames + ")"
+                );
+            }}
+
             STEP = "auto-render-render";
             var tRender = (new Date()).getTime();
             app.project.renderQueue.render();
@@ -705,6 +761,17 @@ def main():
             "to .mp4 and deletes the .mov."
         ),
     )
+    p.add_argument(
+        "--nb-frames",
+        type=int,
+        default=None,
+        help=(
+            "Composite + --auto-render only: exact number of frames "
+            "to render. The .jsx sets rqItem.timeSpanDuration to "
+            "(N-0.5)/fps so AE renders exactly N frames regardless "
+            "of how it snaps comp.duration to a frame boundary."
+        ),
+    )
     args = p.parse_args()
 
     in_path = args.input
@@ -761,16 +828,28 @@ def main():
                 all_frames.add(int(fkey))
         start_frame = min(all_frames) if all_frames else 1
         end_frame = max(all_frames) if all_frames else 48
+        # Don't truncate shape data in composite mode — the .jsx caps
+        # the render window via rqItem.timeSpanDuration. Keeping the
+        # full JSON shape range (including any trailing keyframes
+        # past the input video's last frame) means AE's motion-blur
+        # sampling at the final rendered frame can interpolate from
+        # data on BOTH sides of t=(N-1)/fps, instead of holding the
+        # last keyframe value through the exposure window.
         n_frames = end_frame - start_frame + 1
         shape_duration = n_frames / fps
-        # In composite mode the orchestrator passes the input video's
-        # true duration; we take the larger so neither the shapes nor
-        # the footage get truncated by the comp boundary.
-        duration = (
-            max(shape_duration, args.duration)
-            if args.duration is not None
-            else shape_duration
-        )
+        # In composite mode the orchestrator-supplied --duration is
+        # authoritative: the comp follows the footage exactly so we
+        # don't render a black tail when the shape JSON happens to
+        # span more frames than the source video. Shape keyframes
+        # beyond comp end are simply not rendered by AE.
+        # In shape-only mode we still default to max so the user can
+        # run the .jsx into their own comp without truncating shapes.
+        if args.duration is None:
+            duration = shape_duration
+        elif args.input_video is not None:
+            duration = args.duration
+        else:
+            duration = max(shape_duration, args.duration)
 
         person_color, fg_ids, bg_ids = classify_persons(
             data["objects"], width, height
@@ -815,6 +894,8 @@ def main():
                 payload["markerPath"] = os.path.abspath(
                     os.path.splitext(out_jsx)[0] + ".done"
                 )
+                if args.nb_frames is not None:
+                    payload["nbFrames"] = int(args.nb_frames)
 
         with open(out_data, "w") as f:
             json.dump(payload, f, separators=(",", ":"))

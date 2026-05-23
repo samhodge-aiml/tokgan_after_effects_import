@@ -81,16 +81,12 @@ def ffprobe_video(path):
         # Fallback to format.duration (over-reports on some sources).
         nb_frames = int(round(float(info["format"].get("duration") or 0.0) * fps))
 
-    # AE's addComp(..., duration, fps) creates a comp whose render
-    # queue produces floor(duration*fps + 0.5) + 1 frames - the +1 is
-    # because the boundary at t=duration is *inclusive* of a rendered
-    # frame. To get exactly nb_frames rendered frames matching the
-    # footage frame-by-frame, set duration = (nb_frames - 1) / fps.
-    # That puts the last rendered frame at t=(N-1)/fps which is
-    # exactly where the footage's last frame lives.
-    # Empirically verified on the pilot (3840x2160 25fps 57-frame clip):
-    # (N-0.5)/fps gave 58 frames (one extra); (N-1)/fps gives 57.
-    duration = (nb_frames - 1) / fps
+    # Comp duration covers the render range PLUS one extra frame
+    # PLUS half-frame headroom for the extra frame's own motion-blur
+    # exposure window. The .jsx renders N+1 frames (the extra is
+    # trimmed in transcode); each rendered frame's exposure window
+    # (±0.5/fps around its center) must sit inside the comp.
+    duration = (nb_frames + 2) / fps
 
     return {
         "width": int(video["width"]),
@@ -205,10 +201,23 @@ def osascript_do_script_file(ae_app_name, jsx_path, marker_path, timeout_s):
 
 # ----------------------------- ffmpeg ----------------------------------
 
-def transcode_to_h264(mov_path, mp4_path, crf=16):
+def transcode_to_h264(mov_path, mp4_path, crf=16, vframes=None):
     """Transcode the AE intermediate (.mov, ProRes or Lossless) to a
     streamable H.264 mp4. Audio passes through as AAC if present;
-    ffmpeg silently ignores -c:a when there's no audio stream."""
+    ffmpeg silently ignores -c:a when there's no audio stream.
+
+    `vframes` caps the output frame count. The AE side renders one
+    extra frame past the visible target so motion blur on the actual
+    last visible frame has a 'future' keyframe to interpolate against;
+    -vframes trims that extra here.
+
+    TODO: occasionally the trimmed final frame still shows asymmetric
+    motion blur when the input video stops abruptly (the second-to-
+    last footage frame's exposure window reaches into the trimmed
+    extra). Consider rendering N+2 and trimming both ends if/when
+    this becomes a quality issue. For now the user can manually
+    trim the last frame in post.
+    """
     cmd = [
         "ffmpeg", "-y",
         "-i", mov_path,
@@ -219,8 +228,10 @@ def transcode_to_h264(mov_path, mp4_path, crf=16):
         "-movflags", "+faststart",
         "-c:a", "aac",
         "-b:a", "192k",
-        mp4_path,
     ]
+    if vframes is not None:
+        cmd += ["-vframes", str(vframes)]
+    cmd.append(mp4_path)
     print("$ " + " ".join(shlex.quote(c) for c in cmd))
     subprocess.run(cmd, check=True)
 
@@ -297,6 +308,7 @@ def composite_mode(args):
         "--duration", f"{info['duration']:.6f}",
         "--auto-render",
         "--output-mov", mov_path,
+        "--nb-frames", str(info["nb_frames"]),
         os.path.abspath(args.json),
         jsx_path,
     ]
@@ -328,10 +340,15 @@ def composite_mode(args):
     mov_size = os.path.getsize(mov_path)
     print(f"AE wrote {mov_path}  ({mov_size:,} bytes)")
 
-    # 4. Transcode the intermediate to H.264 mp4.
+    # 4. Transcode the intermediate to H.264 mp4. The AE-side render
+    # produced nb_frames + 1 frames so the *visible* last frame has
+    # proper motion-blur sampling; -vframes trims that extra here so
+    # the output exactly matches the input video's frame count.
     print()
-    print("--- Transcoding intermediate to H.264 mp4 ---")
-    transcode_to_h264(mov_path, mp4_path, crf=args.mp4_crf)
+    print("--- Transcoding intermediate to H.264 mp4 (trim to "
+          f"{info['nb_frames']} frames) ---")
+    transcode_to_h264(mov_path, mp4_path, crf=args.mp4_crf,
+                      vframes=info["nb_frames"])
 
     if not os.path.isfile(mp4_path):
         sys.exit(f"ERROR: ffmpeg returned 0 but {mp4_path} is missing.")

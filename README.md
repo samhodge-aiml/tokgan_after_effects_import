@@ -207,6 +207,18 @@ python3 tokgan_composite.py --cleanup path/to/{stem}__composite.jsx
 This refuses unless `{stem}__composite.mp4` is on disk and at least
 1 MB (sanity gate that the render actually completed).
 
+### Known issue (TODO)
+
+The composite renders **N+1 frames** in AE and `ffmpeg -vframes N`
+trims the extra in the transcode step, so the kept N frames each have
+proper bidirectional motion-blur sampling. In rare cases the trimmed
+final frame can still show a held / asymmetric blur if the input video
+ends abruptly with a hard motion stop (the second-to-last footage
+frame's exposure window samples into the last frame's "future" data,
+which is the trimmed extra). If you spot one of these, just trim one
+more frame off the rendered mp4 manually — see the TODO marker in
+[tokgan_composite.py](tokgan_composite.py).
+
 ## Batch driver
 
 `tokgan_composite_batch.py` walks a Tokgan k3s_queue layout and runs
