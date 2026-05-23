@@ -45,8 +45,9 @@ BACKGROUND_DIM_DIVISOR = 20
 # Bump when the sidecar payload schema changes in a way the loader
 # would have to handle. Sidecars whose stored value differs from this
 # constant are rebuilt on the next run regardless of mtime, so older
-# sidecars without `color` don't quietly stay around.
-PAYLOAD_SCHEMA = 2
+# sidecars without `color` (v2) or `inputVideo` (v3) don't quietly
+# stay around.
+PAYLOAD_SCHEMA = 3
 
 BACKGROUND_GREY = [0.5, 0.5, 0.5]
 
@@ -264,13 +265,39 @@ LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
         STEP = "init-comp";
         app.beginUndoGroup("Import Tokgan Shapes");
 
-        var comp = app.project.activeItem;
-        if (!(comp instanceof CompItem)) {{
+        var compositeMode = !!data.inputVideo;
+        var comp;
+        if (compositeMode) {{
+            STEP = "composite-comp-cleanup";
+            // Remove a prior TokganComposite from re-runs so we don't pile
+            // up duplicates in the project panel.
+            for (var ri = app.project.numItems; ri >= 1; ri--) {{
+                var it = app.project.item(ri);
+                if (it instanceof CompItem && it.name === "TokganComposite") it.remove();
+            }}
+            STEP = "composite-import-footage (" + data.inputVideo + ")";
+            var footFile = new File(data.inputVideo);
+            if (!footFile.exists) throw new Error("Input video not found: " + data.inputVideo);
+            var foot = app.project.importFile(new ImportOptions(footFile));
+            STEP = "composite-create-comp";
             comp = app.project.items.addComp(
-                "TokganShapes",
+                "TokganComposite",
                 data.width, data.height, 1,
                 data.duration, data.fps
             );
+            // Add footage first → it lands at index 1 (top). The shape
+            // layer is added next via addShape(), which inserts at the
+            // new top and pushes footage down to index 2.
+            comp.layers.add(foot);
+        }} else {{
+            comp = app.project.activeItem;
+            if (!(comp instanceof CompItem)) {{
+                comp = app.project.items.addComp(
+                    "TokganShapes",
+                    data.width, data.height, 1,
+                    data.duration, data.fps
+                );
+            }}
         }}
         comp.motionBlur = true;
         var tBuild = (new Date()).getTime();
@@ -372,8 +399,36 @@ LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
         layer.transform.position.setValue([0, 0]);
         layer.motionBlur = true;
 
+        if (compositeMode) {{
+            STEP = "composite-blend-and-shutter";
+            // Multiply blend tints the underlying footage by each shape's
+            // per-person hue; non-shape pixels are left unchanged because
+            // the layer is transparent outside its shapes (multiply with
+            // alpha is treated as no-op).
+            layer.blendingMode = BlendingMode.MULTIPLY;
+            if (typeof data.shutterAngle === "number") {{
+                comp.shutterAngle = data.shutterAngle;
+            }}
+            if (typeof data.shutterPhase === "number") {{
+                // Negative phase = half the negative angle centres the
+                // blur around the source frame rather than trailing it.
+                comp.shutterPhase = data.shutterPhase;
+            }}
+        }}
+
         var tDone = ((new Date()).getTime() - tBuild) / 1000;
         app.endUndoGroup();
+
+        if (compositeMode && data.aepPath) {{
+            STEP = "save-aep (" + data.aepPath + ")";
+            try {{
+                var aepFile = new File(data.aepPath);
+                app.project.save(aepFile);
+                $.writeln("[Tokgan] saved project to " + data.aepPath);
+            }} catch (saveErr) {{
+                $.writeln("[Tokgan] aep save failed: " + saveErr.toString());
+            }}
+        }}
 
         $.writeln(
             "[Tokgan import] " + shapes.length + " layers; " +
@@ -448,6 +503,53 @@ def main():
             "footage's true fps (e.g. --fps 25) to fix the timing."
         ),
     )
+    p.add_argument(
+        "--input-video",
+        default=None,
+        help=(
+            "Switch to composite mode: the generated .jsx will import "
+            "this footage, create a new comp 'TokganComposite' matching "
+            "its width/height/fps/duration, add the shape layer on top "
+            "in MULTIPLY blend mode, set shutter angle/phase for "
+            "correctly centred motion blur, and save the project to "
+            "<out_jsx_stem>.aep so a future headless aerender run can "
+            "pick it up. Without this flag the loader keeps its "
+            "shape-layer-only behaviour."
+        ),
+    )
+    p.add_argument(
+        "--shutter-angle",
+        type=float,
+        default=180.0,
+        help=(
+            "Shutter angle in degrees written into the comp when "
+            "--input-video is set. Default 180 (standard cinema). "
+            "Ignored without --input-video."
+        ),
+    )
+    p.add_argument(
+        "--shutter-phase",
+        type=float,
+        default=-90.0,
+        help=(
+            "Shutter phase in degrees written into the comp when "
+            "--input-video is set. Default -90 (centres motion blur "
+            "around each source frame; pair with shutter-angle 180). "
+            "Ignored without --input-video."
+        ),
+    )
+    p.add_argument(
+        "--duration",
+        type=float,
+        default=None,
+        help=(
+            "Override the comp duration in seconds. Default is the "
+            "shape data's span (last_frame - first_frame + 1) / fps. "
+            "In composite mode the orchestrator passes the input "
+            "video's true duration here so the comp covers the full "
+            "footage even when the shape data is slightly shorter."
+        ),
+    )
     args = p.parse_args()
 
     in_path = args.input
@@ -466,14 +568,16 @@ def main():
         except (OSError, ValueError):
             sidecar_schema_ok = False
 
-    # --fps and --keep-background change sidecar contents without changing
-    # the input file's mtime, so an mtime-only cache check would silently
-    # serve a stale sidecar that ignores the flag. Force rebuild whenever
-    # either is set.
+    # Flags that change sidecar contents without touching the input's
+    # mtime would otherwise let an mtime-only cache check quietly serve
+    # a stale sidecar that ignores the flag. Force rebuild whenever any
+    # of them is set.
     data_is_current = (
         not args.force
         and not args.keep_background
         and args.fps is None
+        and args.input_video is None
+        and args.duration is None
         and sidecar_schema_ok
         and os.path.getmtime(out_data) >= os.path.getmtime(in_path)
     )
@@ -501,7 +605,15 @@ def main():
         start_frame = min(all_frames) if all_frames else 1
         end_frame = max(all_frames) if all_frames else 48
         n_frames = end_frame - start_frame + 1
-        duration = n_frames / fps
+        shape_duration = n_frames / fps
+        # In composite mode the orchestrator passes the input video's
+        # true duration; we take the larger so neither the shapes nor
+        # the footage get truncated by the comp boundary.
+        duration = (
+            max(shape_duration, args.duration)
+            if args.duration is not None
+            else shape_duration
+        )
 
         person_color, fg_ids, bg_ids = classify_persons(
             data["objects"], width, height
@@ -527,6 +639,14 @@ def main():
             "shapes": shapes,
         }
 
+        if args.input_video:
+            payload["inputVideo"] = os.path.abspath(args.input_video)
+            payload["shutterAngle"] = float(args.shutter_angle)
+            payload["shutterPhase"] = float(args.shutter_phase)
+            payload["aepPath"] = os.path.abspath(
+                os.path.splitext(out_jsx)[0] + ".aep"
+            )
+
         with open(out_data, "w") as f:
             json.dump(payload, f, separators=(",", ":"))
 
@@ -536,6 +656,12 @@ def main():
             f"  Persons: {len(fg_ids)} foreground, "
             f"{len(bg_ids)} background ({bg_state})\n"
         )
+        if args.input_video:
+            summary_extra += (
+                f"  Composite mode: footage={os.path.basename(args.input_video)} "
+                f"fps={fps} duration={duration:.3f}s "
+                f"shutter={args.shutter_angle}/{args.shutter_phase}\n"
+            )
         if fg_ids:
             summary_extra += "  Hues:\n"
             for pid in fg_ids:
