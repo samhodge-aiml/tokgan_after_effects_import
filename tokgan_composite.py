@@ -236,19 +236,46 @@ def transcode_to_h264(mov_path, mp4_path, crf=16, vframes=None):
     subprocess.run(cmd, check=True)
 
 
-def relabel_viz_fps(viz_path, target_fps, out_path):
-    """ffmpeg -r N -i in.mp4 -c copy out.mp4 — relabels declared fps
-    without re-encoding. -r BEFORE -i reinterprets the input cadence;
-    -c copy muxes the existing H.264 stream unchanged."""
-    cmd = [
-        "ffmpeg", "-y",
-        "-r", _ffmpeg_rate(target_fps),
-        "-i", viz_path,
-        "-c", "copy",
-        out_path,
-    ]
-    print("$ " + " ".join(shlex.quote(c) for c in cmd))
-    subprocess.run(cmd, check=True)
+def relabel_viz_fps(viz_path, target_fps, out_path, target_nb_frames=None):
+    """No-recompression relabel of a viz video to the target fps.
+
+    `ffmpeg -r N -i ... -c copy ...` alone does NOT actually change the
+    container's reported r_frame_rate — it only re-mux remarks PTS,
+    leaving the muxed fps tag unchanged. Going through the raw H.264
+    elementary stream (h264_mp4toannexb) loses the container's timing
+    metadata, then we re-mux at the target fps which actually sets
+    r_frame_rate on the output.
+
+    If `target_nb_frames` is given, also trim the relabelled output to
+    that many frames so it matches the input video's duration exactly
+    (viz often has 1-3 trailing frames from Tokgan's mp4 -> EXR pipe).
+    """
+    import tempfile
+    tmp_h264 = tempfile.mktemp(suffix=".h264", prefix="tokgan_relabel_")
+    try:
+        step1 = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", viz_path,
+            "-c:v", "copy", "-bsf:v", "h264_mp4toannexb",
+            "-f", "h264", tmp_h264,
+        ]
+        print("$ " + " ".join(shlex.quote(c) for c in step1))
+        subprocess.run(step1, check=True)
+
+        step2 = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-r", _ffmpeg_rate(target_fps),
+            "-i", tmp_h264,
+            "-c", "copy",
+        ]
+        if target_nb_frames is not None:
+            step2 += ["-frames:v", str(target_nb_frames)]
+        step2.append(out_path)
+        print("$ " + " ".join(shlex.quote(c) for c in step2))
+        subprocess.run(step2, check=True)
+    finally:
+        if os.path.exists(tmp_h264):
+            os.remove(tmp_h264)
 
 
 # ----------------------------- main flow -------------------------------
@@ -332,7 +359,10 @@ def composite_mode(args):
     if args.viz_video:
         viz_stem = os.path.splitext(os.path.basename(args.viz_video))[0]
         relabel_out = os.path.join(out_dir, viz_stem + "__relabeled.mp4")
-        relabel_viz_fps(args.viz_video, info["fps"], relabel_out)
+        relabel_viz_fps(
+            args.viz_video, info["fps"], relabel_out,
+            target_nb_frames=info["nb_frames"],
+        )
         print(f"Wrote {relabel_out}  ({os.path.getsize(relabel_out):,} bytes)")
 
     # 3. Drive AE end-to-end (build + queue + render in-process).
