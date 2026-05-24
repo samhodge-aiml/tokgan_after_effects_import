@@ -236,6 +236,31 @@ def transcode_to_h264(mov_path, mp4_path, crf=16, vframes=None):
     subprocess.run(cmd, check=True)
 
 
+def resample_input_to_viz_timing(input_path, viz_fps, viz_nb_frames, out_path):
+    """Re-encode the input video to viz's fps + frame count so the JSON
+    shape data (which was generated from the viz's frame sequence via
+    mp4 -> EXR -> rotobot) aligns frame-for-frame with the footage we
+    feed into AE.
+
+    ffmpeg's `fps={viz_fps}` filter drops or duplicates frames as
+    needed; `-frames:v viz_nb_frames` trims/pads to the exact count.
+    Encoded with x264 at CRF 18 (visually lossless) using `veryfast`
+    preset since this is a throwaway intermediate.
+    """
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-i", input_path,
+        "-vf", f"fps={_ffmpeg_rate(viz_fps)}",
+        "-frames:v", str(viz_nb_frames),
+        "-c:v", "libx264", "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        "-preset", "veryfast",
+        out_path,
+    ]
+    print("$ " + " ".join(shlex.quote(c) for c in cmd))
+    subprocess.run(cmd, check=True)
+
+
 def relabel_viz_fps(viz_path, target_fps, out_path, target_nb_frames=None):
     """No-recompression relabel of a viz video to the target fps.
 
@@ -300,6 +325,38 @@ def composite_mode(args):
         f"  {info['width']}x{info['height']} @ {info['fps']:.6g} fps, "
         f"{info['nb_frames']} frames = {info['duration']:.6f}s"
     )
+
+    # If a viz video is given, IT is the timing authority — the JSON
+    # shape data was generated from its frame sequence, so any drift
+    # between input fps/frames and viz fps/frames will show as
+    # shape-vs-footage misalignment. Resample the input to match viz.
+    if args.viz_video:
+        viz_info = ffprobe_video(args.viz_video)
+        print(f"Viz video:   {args.viz_video}")
+        print(
+            f"  {viz_info['width']}x{viz_info['height']} @ "
+            f"{viz_info['fps']:.6g} fps, {viz_info['nb_frames']} frames"
+        )
+        if (viz_info["fps"] == info["fps"]
+                and viz_info["nb_frames"] == info["nb_frames"]):
+            print("  input already matches viz timing; no resample needed")
+            footage_path = args.input_video
+        else:
+            print("  resampling input -> viz timing")
+            footage_path = "/tmp/tokgan_input_resampled.mp4"
+            resample_input_to_viz_timing(
+                args.input_video, viz_info["fps"], viz_info["nb_frames"],
+                footage_path,
+            )
+        canonical_fps = viz_info["fps"]
+        canonical_nb_frames = viz_info["nb_frames"]
+        canonical_duration = viz_info["nb_frames"] / viz_info["fps"]
+    else:
+        footage_path = args.input_video
+        canonical_fps = info["fps"]
+        canonical_nb_frames = info["nb_frames"]
+        canonical_duration = info["duration"]
+
     print(f"AE app:      {ae_app_name}")
 
     out_dir = args.output_dir or os.path.dirname(os.path.abspath(args.json))
@@ -330,21 +387,21 @@ def composite_mode(args):
     # to 0. Explicit --shape-time-shift on the CLI overrides.
     effective_shift = args.shape_time_shift
     if args.shape_time_shift == 0.0 and args.shape_time_shift_seconds is None:
-        if info["fps"] >= 55:
+        if canonical_fps >= 55:
             effective_shift = -2.0
             print(f"  60-fps-class clip: auto-applying --shape-time-shift -2")
 
     cmd = [
         sys.executable, converter,
         "--force",
-        "--fps", _ffmpeg_rate(info["fps"]),
-        "--input-video", os.path.abspath(args.input_video),
+        "--fps", _ffmpeg_rate(canonical_fps),
+        "--input-video", os.path.abspath(footage_path),
         "--shutter-angle", str(args.shutter_angle),
         "--shutter-phase", str(args.shutter_phase),
-        "--duration", f"{info['duration']:.6f}",
+        "--duration", f"{canonical_duration:.6f}",
         "--auto-render",
         "--output-mov", mov_path,
-        "--nb-frames", str(info["nb_frames"]),
+        "--nb-frames", str(canonical_nb_frames),
         "--shape-time-shift", str(effective_shift),
         os.path.abspath(args.json),
         jsx_path,
@@ -356,14 +413,10 @@ def composite_mode(args):
 
     # 2. Optional viz-video fps relabel (runs in parallel with the AE
     # render — but we keep it serial for simpler error handling).
-    if args.viz_video:
-        viz_stem = os.path.splitext(os.path.basename(args.viz_video))[0]
-        relabel_out = os.path.join(out_dir, viz_stem + "__relabeled.mp4")
-        relabel_viz_fps(
-            args.viz_video, info["fps"], relabel_out,
-            target_nb_frames=info["nb_frames"],
-        )
-        print(f"Wrote {relabel_out}  ({os.path.getsize(relabel_out):,} bytes)")
+    # Viz relabel removed: the viz IS the canonical timing, and we
+    # resampled the input to match it above, so no per-clip relabel
+    # is meaningful. The original viz file in outputs/{hash}/ already
+    # plays back at the canonical fps.
 
     # 3. Drive AE end-to-end (build + queue + render in-process).
     print()
@@ -383,14 +436,15 @@ def composite_mode(args):
     print(f"AE wrote {mov_path}  ({mov_size:,} bytes)")
 
     # 4. Transcode the intermediate to H.264 mp4. The AE-side render
-    # produced nb_frames + 1 frames so the *visible* last frame has
-    # proper motion-blur sampling; -vframes trims that extra here so
-    # the output exactly matches the input video's frame count.
+    # produced canonical_nb_frames + 1 frames so the *visible* last
+    # frame has proper motion-blur sampling; -vframes trims that
+    # extra here so the output exactly matches the viz's frame count
+    # (the timing authority).
     print()
     print("--- Transcoding intermediate to H.264 mp4 (trim to "
-          f"{info['nb_frames']} frames) ---")
+          f"{canonical_nb_frames} frames) ---")
     transcode_to_h264(mov_path, mp4_path, crf=args.mp4_crf,
-                      vframes=info["nb_frames"])
+                      vframes=canonical_nb_frames)
 
     if not os.path.isfile(mp4_path):
         sys.exit(f"ERROR: ffmpeg returned 0 but {mp4_path} is missing.")
@@ -414,6 +468,13 @@ def composite_mode(args):
                 os.remove(target)
                 reclaimed += size
                 print(f"Deleted {target}  ({size:,} bytes)")
+
+    # Also delete the resampled-input temp file if we created one
+    if args.viz_video and footage_path.startswith("/tmp/") and os.path.isfile(footage_path):
+        size = os.path.getsize(footage_path)
+        os.remove(footage_path)
+        reclaimed += size
+        print(f"Deleted {footage_path}  ({size:,} bytes, resampled input)")
 
     print(f"Reclaimed {reclaimed:,} bytes")
     print()
