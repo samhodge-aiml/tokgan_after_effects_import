@@ -144,7 +144,8 @@ def classify_persons(objects, width, height, hue_offset=0.0):
 
 
 def build_shape_record(obj_name, obj, height, start_frame, end_frame, fps,
-                       shape_time_shift_frames=0.0):
+                       shape_time_shift_frames=0.0,
+                       shape_time_shift_seconds=None):
     """Produce a compact dict: name, closed, times, verts, inT, outT, opacity.
 
     JSON coords are screen-style (Y-down, origin top-left) — same as AE —
@@ -156,12 +157,15 @@ def build_shape_record(obj_name, obj, height, start_frame, end_frame, fps,
     frame the footage does, or the composite layers visibly desync at
     the tail.
 
-    `shape_time_shift_frames` shifts every shape keyframe time by
-    `shift / fps` seconds. Use a negative value (e.g. -1.0) to pull
-    shapes earlier in time when Tokgan's per-frame detections appear
-    to lag the footage by a whole frame.
+    Pass either `shape_time_shift_frames` (interpreted as shift/fps
+    seconds) OR `shape_time_shift_seconds` (used directly, takes
+    precedence). Use a negative value to pull shapes earlier when
+    Tokgan's per-frame detections appear to lag the footage.
     """
-    shift_seconds = shape_time_shift_frames / fps
+    if shape_time_shift_seconds is not None:
+        shift_seconds = shape_time_shift_seconds
+    else:
+        shift_seconds = shape_time_shift_frames / fps
     times, verts_all, in_all, out_all = [], [], [], []
     path_frames = []  # source frame numbers that produced a key
     for fkey in sorted(obj.get("frames", {}).keys(), key=int):
@@ -800,11 +804,25 @@ def main():
         default=0.0,
         help=(
             "Shift every shape keyframe (path + opacity) in time by "
-            "this many frames. Negative pulls shapes earlier, positive "
-            "pushes later. Tokgan exports appear to lag the footage by "
-            "1 frame (the per-frame detection seems labelled at the "
-            "end of its exposure window), so pass --shape-time-shift -1 "
-            "to align shapes with their footage frame. Default 0."
+            "this many *source frames*. Negative pulls shapes earlier. "
+            "Frame-units are fps-dependent: -2 frames at 25 fps is "
+            "-80 ms; at 29.97 fps it is only -67 ms. Prefer "
+            "--shape-time-shift-seconds for fps-portable wedging. "
+            "Default 0."
+        ),
+    )
+    p.add_argument(
+        "--shape-time-shift-seconds",
+        type=float,
+        default=None,
+        help=(
+            "Shift every shape keyframe in time by this many *seconds*, "
+            "overriding --shape-time-shift. Use this for fps-portable "
+            "shifts: Tokgan's per-detection lag empirically measures "
+            "~80 ms (= -2 frames at 25 fps), so the orchestrator passes "
+            "--shape-time-shift-seconds -0.08 by default and the same "
+            "absolute time correction lands on every clip regardless "
+            "of its fps."
         ),
     )
     p.add_argument(
@@ -850,6 +868,7 @@ def main():
         and not args.auto_render
         and args.output_mov is None
         and args.shape_time_shift == 0.0
+        and args.shape_time_shift_seconds is None
         and args.hue_offset is None
         and sidecar_schema_ok
         and os.path.getmtime(out_data) >= os.path.getmtime(in_path)
@@ -920,6 +939,7 @@ def main():
             rec = build_shape_record(
                 obj_name, obj, height, start_frame, end_frame, fps,
                 shape_time_shift_frames=args.shape_time_shift,
+                shape_time_shift_seconds=args.shape_time_shift_seconds,
             )
             if rec:
                 rec["color"] = person_color[pid]

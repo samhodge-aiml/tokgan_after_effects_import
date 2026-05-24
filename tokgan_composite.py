@@ -310,6 +310,7 @@ def composite_mode(args):
         "--output-mov", mov_path,
         "--nb-frames", str(info["nb_frames"]),
         "--shape-time-shift", str(args.shape_time_shift),
+        "--shape-time-shift-seconds", str(args.shape_time_shift_seconds),
         os.path.abspath(args.json),
         jsx_path,
     ]
@@ -469,13 +470,24 @@ def main():
     p.add_argument(
         "--shape-time-shift",
         type=float,
-        default=-2.0,
+        default=0.0,
         help=(
-            "Shift every shape keyframe by this many frames in time. "
-            "Negative pulls shapes earlier. Empirically -2 aligns "
-            "Tokgan shapes with the footage frame they belong to (the "
-            "JSON labels each detection two frames later than the "
-            "source video frame the position came from). Default -2."
+            "Shift every shape keyframe by this many SOURCE FRAMES. "
+            "Negative pulls shapes earlier. fps-dependent — prefer "
+            "--shape-time-shift-seconds for cross-fps consistency."
+        ),
+    )
+    p.add_argument(
+        "--shape-time-shift-seconds",
+        type=float,
+        default=-0.08,
+        help=(
+            "Shift every shape keyframe by this many SECONDS, "
+            "overriding --shape-time-shift. Default -0.08 (calibrated "
+            "from a 25 fps wedge where -2 frames eliminated the lag). "
+            "Stays correct at any fps because the underlying Tokgan "
+            "detection lag appears to be a constant ~80 ms regardless "
+            "of source frame rate."
         ),
     )
     p.add_argument(
