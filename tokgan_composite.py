@@ -588,13 +588,14 @@ def main():
     p.add_argument(
         "--shape-time-shift",
         type=float,
-        default=-2.0,
+        default=0.0,
         help=(
-            "Shift every shape keyframe by this many SOURCE FRAMES "
-            "to compensate for Tokgan's intrinsic detection latency. "
-            "Default -2 (empirically the right value across wedge "
-            "clips at 23.976 and 25 fps). Pure-frames so it scales "
-            "correctly at any fps."
+            "Shift every shape keyframe by this many SOURCE FRAMES. "
+            "Default 0 — empirically 24/25/29.97 fps clips align "
+            "correctly with shift=0 once the input is CFR-resampled "
+            "to viz timing. 60-fps-class clips (fps >= 55) auto-apply "
+            "-2 via the orchestrator's per-fps rule when this stays at "
+            "the default 0."
         ),
     )
     p.add_argument(
