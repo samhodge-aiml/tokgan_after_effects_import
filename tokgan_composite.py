@@ -298,6 +298,15 @@ def composite_mode(args):
     # 1. Generate .jsx + sidecar with auto-render configured.
     here = os.path.dirname(os.path.abspath(__file__))
     converter = os.path.join(here, "tokgan_json_to_ae.py")
+    # Per-fps default: 60 (and 59.94) fps clips empirically need a
+    # -2 frame shift to align shapes with footage; other fps default
+    # to 0. Explicit --shape-time-shift on the CLI overrides.
+    effective_shift = args.shape_time_shift
+    if args.shape_time_shift == 0.0 and args.shape_time_shift_seconds is None:
+        if info["fps"] >= 55:
+            effective_shift = -2.0
+            print(f"  60-fps-class clip: auto-applying --shape-time-shift -2")
+
     cmd = [
         sys.executable, converter,
         "--force",
@@ -309,11 +318,12 @@ def composite_mode(args):
         "--auto-render",
         "--output-mov", mov_path,
         "--nb-frames", str(info["nb_frames"]),
-        "--shape-time-shift", str(args.shape_time_shift),
-        "--shape-time-shift-seconds", str(args.shape_time_shift_seconds),
+        "--shape-time-shift", str(effective_shift),
         os.path.abspath(args.json),
         jsx_path,
     ]
+    if args.shape_time_shift_seconds is not None:
+        cmd += ["--shape-time-shift-seconds", str(args.shape_time_shift_seconds)]
     print("$ " + " ".join(shlex.quote(c) for c in cmd))
     subprocess.run(cmd, check=True)
 
@@ -470,24 +480,23 @@ def main():
     p.add_argument(
         "--shape-time-shift",
         type=float,
-        default=0.0,
+        default=-2.0,
         help=(
-            "Shift every shape keyframe by this many SOURCE FRAMES. "
-            "Negative pulls shapes earlier. fps-dependent — prefer "
-            "--shape-time-shift-seconds for cross-fps consistency."
+            "Shift every shape keyframe by this many SOURCE FRAMES "
+            "to compensate for Tokgan's intrinsic detection latency. "
+            "Default -2 (empirically the right value across wedge "
+            "clips at 23.976 and 25 fps). Pure-frames so it scales "
+            "correctly at any fps."
         ),
     )
     p.add_argument(
         "--shape-time-shift-seconds",
         type=float,
-        default=-0.08,
+        default=None,
         help=(
             "Shift every shape keyframe by this many SECONDS, "
-            "overriding --shape-time-shift. Default -0.08 (calibrated "
-            "from a 25 fps wedge where -2 frames eliminated the lag). "
-            "Stays correct at any fps because the underlying Tokgan "
-            "detection lag appears to be a constant ~80 ms regardless "
-            "of source frame rate."
+            "overriding the auto-derived per-clip shift. Leave unset "
+            "to use the per-clip slack-based default (--shape-time-shift-auto)."
         ),
     )
     p.add_argument(

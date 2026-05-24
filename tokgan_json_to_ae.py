@@ -194,6 +194,7 @@ def build_shape_record(obj_name, obj, height, start_frame, end_frame, fps,
         out_all.append(out_t)
         path_frames.append(int(fkey))
 
+
     # Opacity: drive 0 when the shape doesn't exist in a source frame, 100
     # when it does. The shape "exists" iff visibility[f]==1 (preferred) or
     # iff f has path data (fallback when visibility is absent). Each visible
@@ -816,13 +817,22 @@ def main():
         type=float,
         default=None,
         help=(
-            "Shift every shape keyframe in time by this many *seconds*, "
-            "overriding --shape-time-shift. Use this for fps-portable "
-            "shifts: Tokgan's per-detection lag empirically measures "
-            "~80 ms (= -2 frames at 25 fps), so the orchestrator passes "
-            "--shape-time-shift-seconds -0.08 by default and the same "
-            "absolute time correction lands on every clip regardless "
-            "of its fps."
+            "Shift every shape keyframe in time by this many seconds, "
+            "overriding --shape-time-shift and --shape-time-shift-auto."
+        ),
+    )
+    p.add_argument(
+        "--shape-time-shift-auto",
+        action="store_true",
+        help=(
+            "Derive --shape-time-shift-seconds per-clip from the JSON's "
+            "frame count vs the input video's frame count: "
+            "shift = -slack/fps where slack = (json_span - nb_frames). "
+            "Tokgan adds 0..3 trailing 'extrapolation' frames that vary "
+            "per clip, so a single global shift can only be right for "
+            "clips whose slack happens to match. Requires --nb-frames "
+            "(which the orchestrator always passes in composite mode). "
+            "Default off; ignored if --shape-time-shift-seconds is set."
         ),
     )
     p.add_argument(
@@ -896,13 +906,16 @@ def main():
                 all_frames.add(int(fkey))
         start_frame = min(all_frames) if all_frames else 1
         end_frame = max(all_frames) if all_frames else 48
-        # Don't truncate shape data in composite mode — the .jsx caps
-        # the render window via rqItem.timeSpanDuration. Keeping the
-        # full JSON shape range (including any trailing keyframes
-        # past the input video's last frame) means AE's motion-blur
-        # sampling at the final rendered frame can interpolate from
-        # data on BOTH sides of t=(N-1)/fps, instead of holding the
-        # last keyframe value through the exposure window.
+        # Note: we deliberately do NOT truncate end_frame to nb_frames
+        # in composite mode. The JSON's trailing "slack" keyframes
+        # (Tokgan pipeline artifact, +0..+3 frames past the mp4 end)
+        # feed AE's motion-blur interpolation for the kept last frame's
+        # exposure window — without them AE holds the last keyframe
+        # value through the post-frame half of the window, producing
+        # asymmetric / frozen blur and a "shape held from previous
+        # frame" appearance. The N+1 render + ffmpeg trim still bounds
+        # the OUTPUT frame count to exactly nb_frames; the extra JSON
+        # keyframes only contribute as motion-blur sample points.
         n_frames = end_frame - start_frame + 1
         shape_duration = n_frames / fps
         # In composite mode the orchestrator-supplied --duration is
@@ -931,6 +944,28 @@ def main():
         )
         bg_set = set(bg_ids)
 
+        # Resolve effective shape-time-shift in seconds. Precedence:
+        # 1. --shape-time-shift-seconds (explicit user override)
+        # 2. --shape-time-shift-auto + --nb-frames (per-clip slack)
+        # 3. --shape-time-shift / fps (legacy frame-based)
+        if args.shape_time_shift_seconds is not None:
+            effective_shift_seconds = args.shape_time_shift_seconds
+            shift_origin = f"explicit ({effective_shift_seconds:+.4f}s)"
+        elif args.shape_time_shift_auto and args.nb_frames:
+            json_span = end_frame - start_frame + 1
+            slack = json_span - args.nb_frames
+            effective_shift_seconds = -slack / fps
+            shift_origin = (
+                f"auto (slack={slack:+d} frames at {fps:g} fps -> "
+                f"{effective_shift_seconds:+.4f}s)"
+            )
+        else:
+            effective_shift_seconds = args.shape_time_shift / fps
+            shift_origin = (
+                f"frames ({args.shape_time_shift:+g} / {fps:g} fps -> "
+                f"{effective_shift_seconds:+.4f}s)"
+            )
+
         shapes = []
         for obj_name, obj in data["objects"].items():
             pid = person_id_of(obj_name, obj)
@@ -938,8 +973,7 @@ def main():
                 continue
             rec = build_shape_record(
                 obj_name, obj, height, start_frame, end_frame, fps,
-                shape_time_shift_frames=args.shape_time_shift,
-                shape_time_shift_seconds=args.shape_time_shift_seconds,
+                shape_time_shift_seconds=effective_shift_seconds,
             )
             if rec:
                 rec["color"] = person_color[pid]
@@ -986,6 +1020,7 @@ def main():
             f"{len(bg_ids)} background ({bg_state})\n"
             f"  Hue offset: {hue_offset:.4f} of 360 degrees "
             f"({int(round(hue_offset * 360))} deg)\n"
+            f"  Shape time shift: {shift_origin}\n"
         )
         if args.input_video:
             summary_extra += (
