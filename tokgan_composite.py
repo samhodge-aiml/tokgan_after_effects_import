@@ -309,6 +309,7 @@ def composite_mode(args):
         "--auto-render",
         "--output-mov", mov_path,
         "--nb-frames", str(info["nb_frames"]),
+        "--shape-time-shift", str(args.shape_time_shift),
         os.path.abspath(args.json),
         jsx_path,
     ]
@@ -463,6 +464,18 @@ def main():
             "Comp shutter phase in degrees. Default -90 - pairs with "
             "the default 180 shutter angle to centre motion blur around "
             "each source frame instead of trailing it."
+        ),
+    )
+    p.add_argument(
+        "--shape-time-shift",
+        type=float,
+        default=-2.0,
+        help=(
+            "Shift every shape keyframe by this many frames in time. "
+            "Negative pulls shapes earlier. Empirically -2 aligns "
+            "Tokgan shapes with the footage frame they belong to (the "
+            "JSON labels each detection two frames later than the "
+            "source video frame the position came from). Default -2."
         ),
     )
     p.add_argument(

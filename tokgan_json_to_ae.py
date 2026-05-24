@@ -127,7 +127,8 @@ def classify_persons(objects, width, height):
     return person_color, foreground_ids, background_ids
 
 
-def build_shape_record(obj_name, obj, height, start_frame, end_frame, fps):
+def build_shape_record(obj_name, obj, height, start_frame, end_frame, fps,
+                       shape_time_shift_frames=0.0):
     """Produce a compact dict: name, closed, times, verts, inT, outT, opacity.
 
     JSON coords are screen-style (Y-down, origin top-left) — same as AE —
@@ -138,7 +139,13 @@ def build_shape_record(obj_name, obj, height, start_frame, end_frame, fps):
     longer than the source video — the shape data must end on the same
     frame the footage does, or the composite layers visibly desync at
     the tail.
+
+    `shape_time_shift_frames` shifts every shape keyframe time by
+    `shift / fps` seconds. Use a negative value (e.g. -1.0) to pull
+    shapes earlier in time when Tokgan's per-frame detections appear
+    to lag the footage by a whole frame.
     """
+    shift_seconds = shape_time_shift_frames / fps
     times, verts_all, in_all, out_all = [], [], [], []
     path_frames = []  # source frame numbers that produced a key
     for fkey in sorted(obj.get("frames", {}).keys(), key=int):
@@ -160,7 +167,7 @@ def build_shape_record(obj_name, obj, height, start_frame, end_frame, fps):
                 out_t.append(round_pt(p["right_x"] - x, p["right_y"] - y))
             else:
                 out_t.append([0.0, 0.0])
-        t = (int(fkey) - start_frame) / fps
+        t = (int(fkey) - start_frame) / fps + shift_seconds
         times.append(round(t, 6))
         verts_all.append(verts)
         in_all.append(in_t)
@@ -194,21 +201,20 @@ def build_shape_record(obj_name, obj, height, start_frame, end_frame, fps):
         segments.append((s, e))
 
         def _t(frame):
-            return round((frame - start_frame) / fps, 6)
+            return round((frame - start_frame) / fps + shift_seconds, 6)
 
         raw = []
-        for idx, (seg_start, seg_end) in enumerate(segments):
+        for seg_start, seg_end in segments:
             if seg_start > start_frame:
                 raw.append((_t(seg_start - 1), 0))
             raw.append((_t(seg_start), 100))
             raw.append((_t(seg_end), 100))
-            # Trailing off-frame only emitted for non-final segments
-            # (gap between segments). The final segment's shape holds
-            # opacity 100 through the end of the comp so the shape
-            # doesn't blink off one frame before the footage ends
-            # when its Tokgan tracking ran short by a frame.
-            is_final = (idx == len(segments) - 1)
-            if not is_final and seg_end < end_frame:
+            # Always emit the trailing off-frame so opacity drops to 0
+            # at seg_end + 1. With --shape-time-shift -2 the off-frame
+            # lands cleanly within the rendered range instead of right
+            # at the comp boundary, so we no longer need the earlier
+            # "skip trailing off for the final segment" hack.
+            if seg_end < end_frame:
                 raw.append((_t(seg_end + 1), 0))
         if segments[0][0] > start_frame and not any(t == 0.0 for t, _ in raw):
             raw.append((0.0, 0))
@@ -772,6 +778,19 @@ def main():
             "of how it snaps comp.duration to a frame boundary."
         ),
     )
+    p.add_argument(
+        "--shape-time-shift",
+        type=float,
+        default=0.0,
+        help=(
+            "Shift every shape keyframe (path + opacity) in time by "
+            "this many frames. Negative pulls shapes earlier, positive "
+            "pushes later. Tokgan exports appear to lag the footage by "
+            "1 frame (the per-frame detection seems labelled at the "
+            "end of its exposure window), so pass --shape-time-shift -1 "
+            "to align shapes with their footage frame. Default 0."
+        ),
+    )
     args = p.parse_args()
 
     in_path = args.input
@@ -802,6 +821,7 @@ def main():
         and args.duration is None
         and not args.auto_render
         and args.output_mov is None
+        and args.shape_time_shift == 0.0
         and sidecar_schema_ok
         and os.path.getmtime(out_data) >= os.path.getmtime(in_path)
     )
@@ -861,7 +881,10 @@ def main():
             pid = person_id_of(obj_name, obj)
             if pid in bg_set and not args.keep_background:
                 continue
-            rec = build_shape_record(obj_name, obj, height, start_frame, end_frame, fps)
+            rec = build_shape_record(
+                obj_name, obj, height, start_frame, end_frame, fps,
+                shape_time_shift_frames=args.shape_time_shift,
+            )
             if rec:
                 rec["color"] = person_color[pid]
                 shapes.append(rec)
