@@ -31,6 +31,7 @@ Coordinate convention:
 """
 
 import colorsys
+import hashlib
 import json
 import os
 import sys
@@ -66,19 +67,30 @@ def person_id_of(obj_name, obj):
     return int(prefix.lstrip("p"))
 
 
-def hue_palette(n):
+def hue_palette(n, offset=0.0):
     """n evenly spaced hues at full saturation/value, as 3-float RGB
-    lists in 0..1. n==0 returns []. Hue 0 (pure red) is always present
-    when n>=1 so the single-person sample renders identically to today."""
+    lists in 0..1. n==0 returns []. `offset` rotates the entire
+    palette around the colour wheel (0..1, modulo 1); pass a
+    per-clip random offset so playback of many single-person clips
+    in a row doesn't show every p0 as the same red."""
     if n <= 0:
         return []
     return [
-        [round(c, 6) for c in colorsys.hsv_to_rgb(i / n, 1.0, 1.0)]
+        [round(c, 6) for c in colorsys.hsv_to_rgb((i / n + offset) % 1.0, 1.0, 1.0)]
         for i in range(n)
     ]
 
 
-def classify_persons(objects, width, height):
+def hue_offset_from_name(name):
+    """Deterministic hue offset in [0, 1) derived from a filename.
+    Same input always yields the same offset, so re-runs of the same
+    clip produce identical colours; different clips get different
+    starting hues. MD5 first-4-bytes / 2^32 gives a uniform spread."""
+    digest = hashlib.md5(name.encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) / float(0x100000000)
+
+
+def classify_persons(objects, width, height, hue_offset=0.0):
     """Return (person_color, foreground_ids, background_ids).
 
     person_color maps int person_id -> [r,g,b] (foreground hue or
@@ -86,6 +98,10 @@ def classify_persons(objects, width, height):
     lists of ints. Classification uses the per-person maximum across
     all frames of max(bbox_w, bbox_h); the threshold is
     max(width, height) / BACKGROUND_DIM_DIVISOR.
+
+    `hue_offset` rotates the foreground hue palette around the colour
+    wheel — typically derived from the input filename so each clip in
+    a playlist gets a different starting hue.
     """
     threshold = max(width, height) / BACKGROUND_DIM_DIVISOR
 
@@ -119,7 +135,7 @@ def classify_persons(objects, width, height):
     foreground_ids = sorted(p for p, s in max_size.items() if s >= threshold)
     background_ids = sorted(p for p, s in max_size.items() if s < threshold)
 
-    palette = hue_palette(len(foreground_ids))
+    palette = hue_palette(len(foreground_ids), offset=hue_offset)
     person_color = {pid: palette[i] for i, pid in enumerate(foreground_ids)}
     for pid in background_ids:
         person_color[pid] = BACKGROUND_GREY
@@ -791,6 +807,18 @@ def main():
             "to align shapes with their footage frame. Default 0."
         ),
     )
+    p.add_argument(
+        "--hue-offset",
+        type=float,
+        default=None,
+        help=(
+            "Rotate the per-person hue palette by this fraction of the "
+            "colour wheel (0..1). Default: deterministic value derived "
+            "from the input video name (or input JSON name when no "
+            "--input-video is set) so each clip in a playlist gets a "
+            "different starting hue instead of every p0 rendering as red."
+        ),
+    )
     args = p.parse_args()
 
     in_path = args.input
@@ -822,6 +850,7 @@ def main():
         and not args.auto_render
         and args.output_mov is None
         and args.shape_time_shift == 0.0
+        and args.hue_offset is None
         and sidecar_schema_ok
         and os.path.getmtime(out_data) >= os.path.getmtime(in_path)
     )
@@ -871,8 +900,15 @@ def main():
         else:
             duration = max(shape_duration, args.duration)
 
+        if args.hue_offset is not None:
+            hue_offset = args.hue_offset % 1.0
+        else:
+            seed_name = args.input_video or in_path
+            hue_offset = hue_offset_from_name(
+                os.path.splitext(os.path.basename(seed_name))[0]
+            )
         person_color, fg_ids, bg_ids = classify_persons(
-            data["objects"], width, height
+            data["objects"], width, height, hue_offset=hue_offset
         )
         bg_set = set(bg_ids)
 
@@ -928,6 +964,8 @@ def main():
         summary_extra = (
             f"  Persons: {len(fg_ids)} foreground, "
             f"{len(bg_ids)} background ({bg_state})\n"
+            f"  Hue offset: {hue_offset:.4f} of 360 degrees "
+            f"({int(round(hue_offset * 360))} deg)\n"
         )
         if args.input_video:
             summary_extra += (
