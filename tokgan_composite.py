@@ -51,6 +51,29 @@ SAFETY_RENDER_MIN_BYTES = 1_000_000
 
 # ----------------------------- ffprobe ---------------------------------
 
+def _ffmpeg_cfr_frame_count(path):
+    """Count frames the way `ffmpeg -i in.mp4 out%04d.png` would —
+    constant-frame-rate output padded to the container duration.
+    `-vsync cfr -f null -` produces the same count without writing
+    any files. This is the count Tokgan's mp4 -> EXR pipeline uses,
+    so it's also the count the JSON shape data is keyed on.
+    """
+    out = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-i", path,
+            "-map", "0:v:0", "-vsync", "cfr", "-f", "null", "-",
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    # ffmpeg writes its progress to stderr; the final line has the
+    # total frame count.
+    import re
+    matches = re.findall(r"frame=\s*(\d+)", out.stderr)
+    if not matches:
+        raise RuntimeError(f"ffmpeg frame count failed for {path}: {out.stderr[-500:]}")
+    return int(matches[-1])
+
+
 def ffprobe_video(path):
     """Return dict(width, height, fps, duration, nb_frames).
 
@@ -71,21 +94,15 @@ def ffprobe_video(path):
     num, den = video["r_frame_rate"].split("/")
     fps = float(num) / float(den)
 
-    stream_duration = video.get("duration")
-    nb_frames = video.get("nb_frames")
-    if nb_frames is not None:
-        nb_frames = int(nb_frames)
-    elif stream_duration is not None:
-        nb_frames = int(round(float(stream_duration) * fps))
-    else:
-        # Fallback to format.duration (over-reports on some sources).
-        nb_frames = int(round(float(info["format"].get("duration") or 0.0) * fps))
-
-    # Comp duration covers the render range PLUS one extra frame
-    # PLUS half-frame headroom for the extra frame's own motion-blur
-    # exposure window. The .jsx renders N+1 frames (the extra is
-    # trimmed in transcode); each rendered frame's exposure window
-    # (±0.5/fps around its center) must sit inside the comp.
+    # Use the CFR ffmpeg-extracted frame count, NOT the video
+    # stream's nb_frames metadata. They differ when the container's
+    # duration is longer than the video stream's duration — ffmpeg's
+    # PNG extraction (and Tokgan's mp4 -> EXR pipeline, and players
+    # like VMRV2 / QuickTime) pad to the container duration, so the
+    # JSON shape data covers the padded count, not the raw decoded
+    # count. Aligning on the padded count keeps shapes in sync with
+    # the footage frame-by-frame.
+    nb_frames = _ffmpeg_cfr_frame_count(path)
     duration = (nb_frames + 2) / fps
 
     return {
