@@ -399,14 +399,13 @@ def composite_mode(args):
     # 1. Generate .jsx + sidecar with auto-render configured.
     here = os.path.dirname(os.path.abspath(__file__))
     converter = os.path.join(here, "tokgan_json_to_ae.py")
-    # Per-fps default: 60 (and 59.94) fps clips empirically need a
-    # -2 frame shift to align shapes with footage; other fps default
-    # to 0. Explicit --shape-time-shift on the CLI overrides.
+    # Default shift is 0 across all fps once the input has been
+    # CFR-resampled to viz timing. The 60-fps-class -2 rule was
+    # observed under the OLD frame-counting (raw stream nb_frames)
+    # and likely fixed a different bug; with viz-as-authority +
+    # CFR counts it should no longer be needed. Pass --shape-time-shift
+    # explicitly on the CLI to override per-clip.
     effective_shift = args.shape_time_shift
-    if args.shape_time_shift == 0.0 and args.shape_time_shift_seconds is None:
-        if canonical_fps >= 55:
-            effective_shift = -2.0
-            print(f"  60-fps-class clip: auto-applying --shape-time-shift -2")
 
     cmd = [
         sys.executable, converter,
