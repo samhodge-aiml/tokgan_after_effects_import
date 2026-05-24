@@ -360,7 +360,14 @@ def composite_mode(args):
             footage_path = args.input_video
         else:
             print("  resampling input -> viz timing")
-            footage_path = "/tmp/tokgan_input_resampled.mp4"
+            # Use a stem-unique temp name so AE's session-restore on
+            # a previous clip's .aep never points at the same /tmp
+            # path that the current clip's cleanup just deleted (which
+            # would show a "missing footage" dialog and block the
+            # script).
+            footage_path = os.path.join(
+                "/tmp", f"tokgan_resampled_{input_stem}.mp4"
+            )
             resample_input_to_viz_timing(
                 args.input_video, viz_info["fps"], viz_info["nb_frames"],
                 footage_path,
