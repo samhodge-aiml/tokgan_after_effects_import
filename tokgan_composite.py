@@ -337,6 +337,7 @@ def composite_mode(args):
         sys.exit("ERROR: ffmpeg / ffprobe must be on PATH.")
 
     info = ffprobe_video(args.input_video)
+    input_stem = os.path.splitext(os.path.basename(args.input_video))[0]
     print(f"Input video: {args.input_video}")
     print(
         f"  {info['width']}x{info['height']} @ {info['fps']:.6g} fps, "
@@ -386,7 +387,6 @@ def composite_mode(args):
     out_dir = args.output_dir or os.path.dirname(os.path.abspath(args.json))
     os.makedirs(out_dir, exist_ok=True)
 
-    input_stem = os.path.splitext(os.path.basename(args.input_video))[0]
     composite_stem = input_stem + "__composite"
     jsx_path    = os.path.join(out_dir, composite_stem + ".jsx")
     sidecar     = os.path.join(out_dir, composite_stem + "_data.json")
