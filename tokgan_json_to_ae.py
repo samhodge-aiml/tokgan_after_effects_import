@@ -31,6 +31,7 @@ Coordinate convention:
 """
 
 import colorsys
+import hashlib
 import json
 import os
 import sys
@@ -45,8 +46,9 @@ BACKGROUND_DIM_DIVISOR = 20
 # Bump when the sidecar payload schema changes in a way the loader
 # would have to handle. Sidecars whose stored value differs from this
 # constant are rebuilt on the next run regardless of mtime, so older
-# sidecars without `color` don't quietly stay around.
-PAYLOAD_SCHEMA = 2
+# sidecars without `color` (v2), `inputVideo` (v3), or `autoRender`
+# (v4) don't quietly stay around.
+PAYLOAD_SCHEMA = 4
 
 BACKGROUND_GREY = [0.5, 0.5, 0.5]
 
@@ -65,19 +67,30 @@ def person_id_of(obj_name, obj):
     return int(prefix.lstrip("p"))
 
 
-def hue_palette(n):
+def hue_palette(n, offset=0.0):
     """n evenly spaced hues at full saturation/value, as 3-float RGB
-    lists in 0..1. n==0 returns []. Hue 0 (pure red) is always present
-    when n>=1 so the single-person sample renders identically to today."""
+    lists in 0..1. n==0 returns []. `offset` rotates the entire
+    palette around the colour wheel (0..1, modulo 1); pass a
+    per-clip random offset so playback of many single-person clips
+    in a row doesn't show every p0 as the same red."""
     if n <= 0:
         return []
     return [
-        [round(c, 6) for c in colorsys.hsv_to_rgb(i / n, 1.0, 1.0)]
+        [round(c, 6) for c in colorsys.hsv_to_rgb((i / n + offset) % 1.0, 1.0, 1.0)]
         for i in range(n)
     ]
 
 
-def classify_persons(objects, width, height):
+def hue_offset_from_name(name):
+    """Deterministic hue offset in [0, 1) derived from a filename.
+    Same input always yields the same offset, so re-runs of the same
+    clip produce identical colours; different clips get different
+    starting hues. MD5 first-4-bytes / 2^32 gives a uniform spread."""
+    digest = hashlib.md5(name.encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) / float(0x100000000)
+
+
+def classify_persons(objects, width, height, hue_offset=0.0):
     """Return (person_color, foreground_ids, background_ids).
 
     person_color maps int person_id -> [r,g,b] (foreground hue or
@@ -85,6 +98,10 @@ def classify_persons(objects, width, height):
     lists of ints. Classification uses the per-person maximum across
     all frames of max(bbox_w, bbox_h); the threshold is
     max(width, height) / BACKGROUND_DIM_DIVISOR.
+
+    `hue_offset` rotates the foreground hue palette around the colour
+    wheel — typically derived from the input filename so each clip in
+    a playlist gets a different starting hue.
     """
     threshold = max(width, height) / BACKGROUND_DIM_DIVISOR
 
@@ -118,7 +135,7 @@ def classify_persons(objects, width, height):
     foreground_ids = sorted(p for p, s in max_size.items() if s >= threshold)
     background_ids = sorted(p for p, s in max_size.items() if s < threshold)
 
-    palette = hue_palette(len(foreground_ids))
+    palette = hue_palette(len(foreground_ids), offset=hue_offset)
     person_color = {pid: palette[i] for i, pid in enumerate(foreground_ids)}
     for pid in background_ids:
         person_color[pid] = BACKGROUND_GREY
@@ -126,15 +143,35 @@ def classify_persons(objects, width, height):
     return person_color, foreground_ids, background_ids
 
 
-def build_shape_record(obj_name, obj, height, start_frame, end_frame, fps):
+def build_shape_record(obj_name, obj, height, start_frame, end_frame, fps,
+                       shape_time_shift_frames=0.0,
+                       shape_time_shift_seconds=None):
     """Produce a compact dict: name, closed, times, verts, inT, outT, opacity.
 
     JSON coords are screen-style (Y-down, origin top-left) — same as AE —
     despite an upstream docstring claiming Nuke convention. No Y flip.
+
+    Frames whose index is outside [start_frame, end_frame] are dropped.
+    This lets the caller cap a Tokgan JSON that happens to be one frame
+    longer than the source video — the shape data must end on the same
+    frame the footage does, or the composite layers visibly desync at
+    the tail.
+
+    Pass either `shape_time_shift_frames` (interpreted as shift/fps
+    seconds) OR `shape_time_shift_seconds` (used directly, takes
+    precedence). Use a negative value to pull shapes earlier when
+    Tokgan's per-frame detections appear to lag the footage.
     """
+    if shape_time_shift_seconds is not None:
+        shift_seconds = shape_time_shift_seconds
+    else:
+        shift_seconds = shape_time_shift_frames / fps
     times, verts_all, in_all, out_all = [], [], [], []
     path_frames = []  # source frame numbers that produced a key
     for fkey in sorted(obj.get("frames", {}).keys(), key=int):
+        fi = int(fkey)
+        if fi < start_frame or fi > end_frame:
+            continue
         pts = obj["frames"][fkey].get("points", [])
         if not pts:
             continue
@@ -150,12 +187,13 @@ def build_shape_record(obj_name, obj, height, start_frame, end_frame, fps):
                 out_t.append(round_pt(p["right_x"] - x, p["right_y"] - y))
             else:
                 out_t.append([0.0, 0.0])
-        t = (int(fkey) - start_frame) / fps
+        t = (int(fkey) - start_frame) / fps + shift_seconds
         times.append(round(t, 6))
         verts_all.append(verts)
         in_all.append(in_t)
         out_all.append(out_t)
         path_frames.append(int(fkey))
+
 
     # Opacity: drive 0 when the shape doesn't exist in a source frame, 100
     # when it does. The shape "exists" iff visibility[f]==1 (preferred) or
@@ -163,7 +201,10 @@ def build_shape_record(obj_name, obj, height, start_frame, end_frame, fps):
     # segment emits four hold-stepped keys so AE shows a clean on/off step.
     visibility = obj.get("visibility", {})
     if visibility:
-        exists = sorted(int(k) for k, v in visibility.items() if v)
+        exists = sorted(
+            int(k) for k, v in visibility.items()
+            if v and start_frame <= int(k) <= end_frame
+        )
     else:
         exists = list(path_frames)
 
@@ -181,7 +222,7 @@ def build_shape_record(obj_name, obj, height, start_frame, end_frame, fps):
         segments.append((s, e))
 
         def _t(frame):
-            return round((frame - start_frame) / fps, 6)
+            return round((frame - start_frame) / fps + shift_seconds, 6)
 
         raw = []
         for seg_start, seg_end in segments:
@@ -189,8 +230,13 @@ def build_shape_record(obj_name, obj, height, start_frame, end_frame, fps):
                 raw.append((_t(seg_start - 1), 0))
             raw.append((_t(seg_start), 100))
             raw.append((_t(seg_end), 100))
-            if seg_end < end_frame:
-                raw.append((_t(seg_end + 1), 0))
+            # Always emit the trailing off-key (even when seg_end ==
+            # end_frame). The comp can extend past the JSON's last
+            # frame (e.g. when the input mp4's CFR count > JSON max),
+            # and without the off-key the shape's opacity would stay
+            # at 100 indefinitely and hold the shape visible through
+            # the rest of the comp.
+            raw.append((_t(seg_end + 1), 0))
         if segments[0][0] > start_frame and not any(t == 0.0 for t, _ in raw):
             raw.append((0.0, 0))
 
@@ -214,6 +260,11 @@ LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
 // Sidecar JSON ({data_basename}) is expected next to this script.
 (function() {{
     var STEP = "init";
+    // Best-effort: silence in-script dialogs (does not affect AE's
+    // first-launch prompts — those are gated by user preferences).
+    try {{ app.beginSuppressDialogs(); }} catch (eSD) {{
+        try {{ app.beginSuppressDialogs(true); }} catch (eSD2) {{}}
+    }}
     try {{
         STEP = "locate-script";
         var scriptFile = new File($.fileName);
@@ -264,13 +315,103 @@ LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
         STEP = "init-comp";
         app.beginUndoGroup("Import Tokgan Shapes");
 
-        var comp = app.project.activeItem;
-        if (!(comp instanceof CompItem)) {{
+        var compositeMode = !!data.inputVideo;
+        var comp;
+        if (compositeMode) {{
+            STEP = "composite-safety-checks";
+            // Permitted starting states for composite-mode:
+            //   (a) fresh AE (no project open)
+            //   (b) our own .aep already open (re-run on same clip)
+            //   (c) some *other* __composite.aep open from a prior batch
+            //       iteration — close it silently and proceed
+            // Anything else (foreign project, dirty work) is bailed
+            // with a clear error so we never relocate the user's
+            // saved file path via app.project.save(newPath).
+            var openFile = app.project.file;
+            var isOurAep = openFile && data.aepPath &&
+                           openFile.fsName === data.aepPath;
+            var isPriorComposite = openFile &&
+                /__composite\.aep$/i.test(openFile.name);
+            if (!isOurAep) {{
+                if (app.project.dirty && !isPriorComposite) {{
+                    throw new Error(
+                        "AE has unsaved changes in a foreign project. " +
+                        "Save or discard them before running tokgan_composite."
+                    );
+                }}
+                if (openFile && !isPriorComposite) {{
+                    throw new Error(
+                        "AE has another project open: " + openFile.fsName +
+                        " - close it (File > Close Project) before running " +
+                        "tokgan_composite, otherwise app.project.save() would " +
+                        "relocate that project's file path."
+                    );
+                }}
+                if (isPriorComposite) {{
+                    // Silent close — the prior composite was re-saved at
+                    // the end of its own run, so we discard any in-memory
+                    // changes since (none, typically).
+                    try {{
+                        app.project.close(CloseOptions.DO_NOT_SAVE_CHANGES);
+                    }} catch (eClose) {{
+                        $.writeln("[Tokgan] couldn't close prior composite: " + eClose.toString());
+                    }}
+                }}
+            }}
+
+            STEP = "composite-comp-cleanup";
+            // Remove a prior TokganComposite from re-runs so we don't pile
+            // up duplicates in the project panel.
+            for (var ri = app.project.numItems; ri >= 1; ri--) {{
+                var it = app.project.item(ri);
+                if (it instanceof CompItem && it.name === "TokganComposite") it.remove();
+            }}
+            // Clear any leftover render queue items (Done from prior
+            // runs or stale "Queued" entries from failed runs). After
+            // the safety checks above, the project is either fresh or
+            // our own .aep — no user queue items to preserve.
+            for (var qi = app.project.renderQueue.numItems; qi >= 1; qi--) {{
+                app.project.renderQueue.item(qi).remove();
+            }}
+            STEP = "composite-import-footage (" + data.inputVideo + ")";
+            var footFile = new File(data.inputVideo);
+            if (!footFile.exists) throw new Error("Input footage not found: " + data.inputVideo);
+            var importOpts = new ImportOptions(footFile);
+            if (data.inputIsSequence) {{
+                // Image sequence: AE picks up all sibling
+                // frame_NNNN.png files as one FootageItem.
+                importOpts.sequence = true;
+            }}
+            var foot = app.project.importFile(importOpts);
+            if (data.inputIsSequence) {{
+                // AE's default Sequence Footage Frame Rate prefs is
+                // usually 30 fps — that would make the imported
+                // sequence play at 30 fps inside our 25 fps comp and
+                // drift the footage off the JSON shape timing. Force
+                // the footage's interpreted frame rate to match the
+                // comp.
+                foot.mainSource.conformFrameRate = data.fps;
+                $.writeln("[Tokgan] conformed sequence to " + data.fps + " fps");
+            }}
+            STEP = "composite-create-comp";
             comp = app.project.items.addComp(
-                "TokganShapes",
+                "TokganComposite",
                 data.width, data.height, 1,
                 data.duration, data.fps
             );
+            // Add footage first → it lands at index 1 (top). The shape
+            // layer is added next via addShape(), which inserts at the
+            // new top and pushes footage down to index 2.
+            comp.layers.add(foot);
+        }} else {{
+            comp = app.project.activeItem;
+            if (!(comp instanceof CompItem)) {{
+                comp = app.project.items.addComp(
+                    "TokganShapes",
+                    data.width, data.height, 1,
+                    data.duration, data.fps
+                );
+            }}
         }}
         comp.motionBlur = true;
         var tBuild = (new Date()).getTime();
@@ -372,23 +513,159 @@ LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
         layer.transform.position.setValue([0, 0]);
         layer.motionBlur = true;
 
+        if (compositeMode) {{
+            STEP = "composite-blend-and-shutter";
+            // Multiply blend tints the underlying footage by each shape's
+            // per-person hue; non-shape pixels are left unchanged because
+            // the layer is transparent outside its shapes (multiply with
+            // alpha is treated as no-op).
+            layer.blendingMode = BlendingMode.MULTIPLY;
+            if (typeof data.shutterAngle === "number") {{
+                comp.shutterAngle = data.shutterAngle;
+            }}
+            if (typeof data.shutterPhase === "number") {{
+                // Negative phase = half the negative angle centres the
+                // blur around the source frame rather than trailing it.
+                comp.shutterPhase = data.shutterPhase;
+            }}
+        }}
+
         var tDone = ((new Date()).getTime() - tBuild) / 1000;
         app.endUndoGroup();
+
+        if (compositeMode && data.aepPath) {{
+            STEP = "save-aep (" + data.aepPath + ")";
+            try {{
+                var aepFile = new File(data.aepPath);
+                app.project.save(aepFile);
+                $.writeln("[Tokgan] saved project to " + data.aepPath);
+            }} catch (saveErr) {{
+                $.writeln("[Tokgan] aep save failed: " + saveErr.toString());
+            }}
+        }}
+
+        if (compositeMode && data.autoRender && data.outputMov) {{
+            STEP = "auto-render-queue";
+            // Auto-render: add a render queue item, pick the best
+            // available output module, and trigger render() in-process.
+            // app.project.renderQueue.render() blocks AE until done, so
+            // an AppleScript DoScript driver naturally waits for the
+            // .mov to land before returning control to the shell.
+            var rqItem = app.project.renderQueue.items.add(comp);
+            var outModule = rqItem.outputModule(1);
+
+            STEP = "auto-render-output-module-template";
+            // Try ProRes first (smaller intermediates), fall back to
+            // the Lossless template which is always present. The shell
+            // orchestrator transcodes to H.264 mp4 afterwards either way.
+            var templateUsed = null;
+            var templateCandidates = [
+                "Apple ProRes 422 HQ",
+                "ProRes 422 HQ",
+                "Apple ProRes 422",
+                "Lossless"
+            ];
+            for (var tc = 0; tc < templateCandidates.length; tc++) {{
+                try {{
+                    outModule.applyTemplate(templateCandidates[tc]);
+                    templateUsed = templateCandidates[tc];
+                    break;
+                }} catch (tplErr) {{ /* try next */ }}
+            }}
+            if (templateUsed === null) {{
+                throw new Error("No usable output module template found");
+            }}
+            $.writeln("[Tokgan] output module template: " + templateUsed);
+
+            STEP = "auto-render-output-file";
+            outModule.file = new File(data.outputMov);
+
+            if (typeof data.nbFrames === "number" && data.nbFrames > 0) {{
+                STEP = "auto-render-time-span";
+                // Render exactly nbFrames. With the footage now
+                // conformed to comp fps via mainSource.conformFrameRate
+                // the per-frame timing is correct, so we no longer
+                // need the N+1 render + ffmpeg trim "future-data" hack
+                // that was previously masking the fps mismatch.
+                rqItem.timeSpanStart = 0;
+                rqItem.timeSpanDuration = data.nbFrames / comp.frameRate;
+                $.writeln(
+                    "[Tokgan] timeSpan set to " +
+                    rqItem.timeSpanDuration.toFixed(6) +
+                    "s (render " + data.nbFrames + " frames)"
+                );
+            }}
+
+            STEP = "auto-render-render";
+            var tRender = (new Date()).getTime();
+            app.project.renderQueue.render();
+            var tRendered = ((new Date()).getTime() - tRender) / 1000;
+            $.writeln(
+                "[Tokgan] render done in " + tRendered.toFixed(1) + "s -> " +
+                data.outputMov
+            );
+
+            // render() marks queue items as "Done", which dirties the
+            // project. Re-save so a subsequent re-run's safety check
+            // sees a clean project (and so the .aep on disk records
+            // the completed-queue state).
+            if (data.aepPath) {{
+                STEP = "auto-render-resave-aep";
+                try {{ app.project.save(new File(data.aepPath)); }} catch (eRS) {{}}
+            }}
+        }}
 
         $.writeln(
             "[Tokgan import] " + shapes.length + " layers; " +
             "JSON parse " + tParse.toFixed(2) + "s; " +
             "AE build " + tDone.toFixed(2) + "s"
         );
+
+        // Completion marker: AE's AppleScript DoScript may or may not
+        // wait for the script to finish (it's effectively async in
+        // AE 2025), so the shell-side orchestrator polls for this
+        // file's existence instead of trusting the osascript return.
+        // Empty file = success; non-empty = error message.
+        if (data && data.markerPath) {{
+            try {{
+                var doneFile = new File(data.markerPath);
+                doneFile.encoding = "UTF-8";
+                if (doneFile.open("w")) {{ doneFile.write(""); doneFile.close(); }}
+            }} catch (eDone) {{ /* best-effort */ }}
+        }}
     }} catch (err) {{
         try {{ app.endUndoGroup(); }} catch (e2) {{}}
-        alert(
+        var failMsg = (
             "Tokgan import failed.\n" +
             "Step: " + STEP + "\n" +
             "Error: " + err.toString() + "\n" +
             "Line:  " + (err.line || "?") + "\n" +
             "File:  " + (err.fileName || "?")
         );
+        // Mirror the success-path marker write so the orchestrator
+        // doesn't time out on a script failure. Non-empty content =
+        // error; Python reads it back as the failure reason.
+        try {{
+            if (typeof data !== "undefined" && data && data.markerPath) {{
+                var errFile = new File(data.markerPath);
+                errFile.encoding = "UTF-8";
+                if (errFile.open("w")) {{ errFile.write(failMsg); errFile.close(); }}
+            }}
+        }} catch (eMarker) {{}}
+        // In auto-render mode, neither alert (would hang the
+        // AppleScript driver on a modal) nor throw (would pop an AE
+        // script-error dialog) is acceptable. The marker file written
+        // above is the canonical error channel - osascript exits
+        // cleanly and Python reads the marker content as the failure
+        // reason. In shape-only mode keep alert() for visibility.
+        var autoRunning = false;
+        try {{ autoRunning = !!(typeof data !== "undefined" && data && data.autoRender); }} catch (eg) {{}}
+        if (autoRunning) {{
+            $.writeln("[Tokgan ERROR] " + failMsg);
+            // Deliberately do not re-throw - marker file carries the error.
+        }} else {{
+            alert(failMsg);
+        }}
     }}
 }})();
 """
@@ -448,6 +725,149 @@ def main():
             "footage's true fps (e.g. --fps 25) to fix the timing."
         ),
     )
+    p.add_argument(
+        "--input-video",
+        default=None,
+        help=(
+            "Switch to composite mode: the generated .jsx will import "
+            "this footage, create a new comp 'TokganComposite' matching "
+            "its width/height/fps/duration, add the shape layer on top "
+            "in MULTIPLY blend mode, set shutter angle/phase for "
+            "correctly centred motion blur, and save the project to "
+            "<out_jsx_stem>.aep so a future headless aerender run can "
+            "pick it up. Without this flag the loader keeps its "
+            "shape-layer-only behaviour. Can also point to the first "
+            "file of a PNG image sequence (combine with --input-is-sequence)."
+        ),
+    )
+    p.add_argument(
+        "--input-is-sequence",
+        action="store_true",
+        help=(
+            "When --input-video points to an image sequence (e.g. the "
+            "first frame_NNNN.png), tell AE to import it with "
+            "ImportOptions.sequence=true so all numbered frames are "
+            "loaded as one footage item at the comp's frame rate. "
+            "This avoids AE misreading the container fps on mp4 inputs."
+        ),
+    )
+    p.add_argument(
+        "--shutter-angle",
+        type=float,
+        default=180.0,
+        help=(
+            "Shutter angle in degrees written into the comp when "
+            "--input-video is set. Default 180 (standard cinema). "
+            "Ignored without --input-video."
+        ),
+    )
+    p.add_argument(
+        "--shutter-phase",
+        type=float,
+        default=-90.0,
+        help=(
+            "Shutter phase in degrees written into the comp when "
+            "--input-video is set. Default -90 (centres motion blur "
+            "around each source frame; pair with shutter-angle 180). "
+            "Ignored without --input-video."
+        ),
+    )
+    p.add_argument(
+        "--duration",
+        type=float,
+        default=None,
+        help=(
+            "Override the comp duration in seconds. Default is the "
+            "shape data's span (last_frame - first_frame + 1) / fps. "
+            "In composite mode the orchestrator passes the input "
+            "video's true duration here so the comp covers the full "
+            "footage even when the shape data is slightly shorter."
+        ),
+    )
+    p.add_argument(
+        "--auto-render",
+        action="store_true",
+        help=(
+            "Composite mode only: extend the .jsx so it adds a render "
+            "queue item and triggers renderQueue.render() in-process. "
+            "Combined with --output-mov, the .jsx writes a ProRes or "
+            "Lossless intermediate to that path. The orchestrator "
+            "drives this end-to-end via osascript DoScriptFile and "
+            "then ffmpeg-transcodes to H.264 mp4. Without this flag "
+            "the .jsx still builds the comp + queue but the user has "
+            "to hit Render manually."
+        ),
+    )
+    p.add_argument(
+        "--output-mov",
+        default=None,
+        help=(
+            "Composite + --auto-render only: where the .jsx tells AE "
+            "to write the intermediate .mov (ProRes or Lossless, "
+            "depending on which output module template the install "
+            "happens to have). The orchestrator then transcodes this "
+            "to .mp4 and deletes the .mov."
+        ),
+    )
+    p.add_argument(
+        "--nb-frames",
+        type=int,
+        default=None,
+        help=(
+            "Composite + --auto-render only: exact number of frames "
+            "to render. The .jsx sets rqItem.timeSpanDuration to "
+            "(N-0.5)/fps so AE renders exactly N frames regardless "
+            "of how it snaps comp.duration to a frame boundary."
+        ),
+    )
+    p.add_argument(
+        "--shape-time-shift",
+        type=float,
+        default=0.0,
+        help=(
+            "Shift every shape keyframe (path + opacity) in time by "
+            "this many *source frames*. Negative pulls shapes earlier. "
+            "Frame-units are fps-dependent: -2 frames at 25 fps is "
+            "-80 ms; at 29.97 fps it is only -67 ms. Prefer "
+            "--shape-time-shift-seconds for fps-portable wedging. "
+            "Default 0."
+        ),
+    )
+    p.add_argument(
+        "--shape-time-shift-seconds",
+        type=float,
+        default=None,
+        help=(
+            "Shift every shape keyframe in time by this many seconds, "
+            "overriding --shape-time-shift and --shape-time-shift-auto."
+        ),
+    )
+    p.add_argument(
+        "--shape-time-shift-auto",
+        action="store_true",
+        help=(
+            "Derive --shape-time-shift-seconds per-clip from the JSON's "
+            "frame count vs the input video's frame count: "
+            "shift = -slack/fps where slack = (json_span - nb_frames). "
+            "Tokgan adds 0..3 trailing 'extrapolation' frames that vary "
+            "per clip, so a single global shift can only be right for "
+            "clips whose slack happens to match. Requires --nb-frames "
+            "(which the orchestrator always passes in composite mode). "
+            "Default off; ignored if --shape-time-shift-seconds is set."
+        ),
+    )
+    p.add_argument(
+        "--hue-offset",
+        type=float,
+        default=None,
+        help=(
+            "Rotate the per-person hue palette by this fraction of the "
+            "colour wheel (0..1). Default: deterministic value derived "
+            "from the input video name (or input JSON name when no "
+            "--input-video is set) so each clip in a playlist gets a "
+            "different starting hue instead of every p0 rendering as red."
+        ),
+    )
     args = p.parse_args()
 
     in_path = args.input
@@ -466,14 +886,21 @@ def main():
         except (OSError, ValueError):
             sidecar_schema_ok = False
 
-    # --fps and --keep-background change sidecar contents without changing
-    # the input file's mtime, so an mtime-only cache check would silently
-    # serve a stale sidecar that ignores the flag. Force rebuild whenever
-    # either is set.
+    # Flags that change sidecar contents without touching the input's
+    # mtime would otherwise let an mtime-only cache check quietly serve
+    # a stale sidecar that ignores the flag. Force rebuild whenever any
+    # of them is set.
     data_is_current = (
         not args.force
         and not args.keep_background
         and args.fps is None
+        and args.input_video is None
+        and args.duration is None
+        and not args.auto_render
+        and args.output_mov is None
+        and args.shape_time_shift == 0.0
+        and args.shape_time_shift_seconds is None
+        and args.hue_offset is None
         and sidecar_schema_ok
         and os.path.getmtime(out_data) >= os.path.getmtime(in_path)
     )
@@ -500,20 +927,75 @@ def main():
                 all_frames.add(int(fkey))
         start_frame = min(all_frames) if all_frames else 1
         end_frame = max(all_frames) if all_frames else 48
+        # Note: we deliberately do NOT truncate end_frame to nb_frames
+        # in composite mode. The JSON's trailing "slack" keyframes
+        # (Tokgan pipeline artifact, +0..+3 frames past the mp4 end)
+        # feed AE's motion-blur interpolation for the kept last frame's
+        # exposure window — without them AE holds the last keyframe
+        # value through the post-frame half of the window, producing
+        # asymmetric / frozen blur and a "shape held from previous
+        # frame" appearance. The N+1 render + ffmpeg trim still bounds
+        # the OUTPUT frame count to exactly nb_frames; the extra JSON
+        # keyframes only contribute as motion-blur sample points.
         n_frames = end_frame - start_frame + 1
-        duration = n_frames / fps
+        shape_duration = n_frames / fps
+        # In composite mode the orchestrator-supplied --duration is
+        # authoritative: the comp follows the footage exactly so we
+        # don't render a black tail when the shape JSON happens to
+        # span more frames than the source video. Shape keyframes
+        # beyond comp end are simply not rendered by AE.
+        # In shape-only mode we still default to max so the user can
+        # run the .jsx into their own comp without truncating shapes.
+        if args.duration is None:
+            duration = shape_duration
+        elif args.input_video is not None:
+            duration = args.duration
+        else:
+            duration = max(shape_duration, args.duration)
 
+        if args.hue_offset is not None:
+            hue_offset = args.hue_offset % 1.0
+        else:
+            seed_name = args.input_video or in_path
+            hue_offset = hue_offset_from_name(
+                os.path.splitext(os.path.basename(seed_name))[0]
+            )
         person_color, fg_ids, bg_ids = classify_persons(
-            data["objects"], width, height
+            data["objects"], width, height, hue_offset=hue_offset
         )
         bg_set = set(bg_ids)
+
+        # Resolve effective shape-time-shift in seconds. Precedence:
+        # 1. --shape-time-shift-seconds (explicit user override)
+        # 2. --shape-time-shift-auto + --nb-frames (per-clip slack)
+        # 3. --shape-time-shift / fps (legacy frame-based)
+        if args.shape_time_shift_seconds is not None:
+            effective_shift_seconds = args.shape_time_shift_seconds
+            shift_origin = f"explicit ({effective_shift_seconds:+.4f}s)"
+        elif args.shape_time_shift_auto and args.nb_frames:
+            json_span = end_frame - start_frame + 1
+            slack = json_span - args.nb_frames
+            effective_shift_seconds = -slack / fps
+            shift_origin = (
+                f"auto (slack={slack:+d} frames at {fps:g} fps -> "
+                f"{effective_shift_seconds:+.4f}s)"
+            )
+        else:
+            effective_shift_seconds = args.shape_time_shift / fps
+            shift_origin = (
+                f"frames ({args.shape_time_shift:+g} / {fps:g} fps -> "
+                f"{effective_shift_seconds:+.4f}s)"
+            )
 
         shapes = []
         for obj_name, obj in data["objects"].items():
             pid = person_id_of(obj_name, obj)
             if pid in bg_set and not args.keep_background:
                 continue
-            rec = build_shape_record(obj_name, obj, height, start_frame, end_frame, fps)
+            rec = build_shape_record(
+                obj_name, obj, height, start_frame, end_frame, fps,
+                shape_time_shift_seconds=effective_shift_seconds,
+            )
             if rec:
                 rec["color"] = person_color[pid]
                 shapes.append(rec)
@@ -527,6 +1009,29 @@ def main():
             "shapes": shapes,
         }
 
+        if args.input_video:
+            payload["inputVideo"] = os.path.abspath(args.input_video)
+            payload["inputIsSequence"] = bool(args.input_is_sequence)
+            payload["shutterAngle"] = float(args.shutter_angle)
+            payload["shutterPhase"] = float(args.shutter_phase)
+            payload["aepPath"] = os.path.abspath(
+                os.path.splitext(out_jsx)[0] + ".aep"
+            )
+            if args.auto_render:
+                if not args.output_mov:
+                    sys.exit(
+                        "ERROR: --auto-render requires --output-mov PATH"
+                    )
+                payload["autoRender"] = True
+                payload["outputMov"] = os.path.abspath(args.output_mov)
+                # Marker file the orchestrator polls for, so it
+                # doesn't have to trust osascript's return semantics.
+                payload["markerPath"] = os.path.abspath(
+                    os.path.splitext(out_jsx)[0] + ".done"
+                )
+                if args.nb_frames is not None:
+                    payload["nbFrames"] = int(args.nb_frames)
+
         with open(out_data, "w") as f:
             json.dump(payload, f, separators=(",", ":"))
 
@@ -535,7 +1040,22 @@ def main():
         summary_extra = (
             f"  Persons: {len(fg_ids)} foreground, "
             f"{len(bg_ids)} background ({bg_state})\n"
+            f"  Hue offset: {hue_offset:.4f} of 360 degrees "
+            f"({int(round(hue_offset * 360))} deg)\n"
+            f"  Shape time shift: {shift_origin}\n"
         )
+        if args.input_video:
+            summary_extra += (
+                f"  Composite mode: footage={os.path.basename(args.input_video)} "
+                f"fps={fps} duration={duration:.3f}s "
+                f"shutter={args.shutter_angle}/{args.shutter_phase}\n"
+            )
+            if args.auto_render:
+                summary_extra += (
+                    f"  Auto-render: ON -> "
+                    f"{os.path.basename(args.output_mov)} "
+                    f"(via in-script renderQueue.render())\n"
+                )
         if fg_ids:
             summary_extra += "  Hues:\n"
             for pid in fg_ids:
