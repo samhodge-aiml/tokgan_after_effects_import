@@ -95,6 +95,12 @@ def main():
                    help="Pass --keep-intermediates through to each per-pair run.")
     p.add_argument("--ae-timeout", type=int, default=600,
                    help="Per-pair AE timeout (s). Default 600.")
+    p.add_argument("--ae-restart-every", type=int, default=10,
+                   help=(
+                       "Quit and relaunch AE every N successful renders to "
+                       "flush AE's memory leaks across sustained batches. "
+                       "Default 10. Set to 0 to disable the recycle."
+                   ))
     args = p.parse_args()
 
     here = os.path.dirname(os.path.abspath(__file__))
@@ -151,6 +157,39 @@ def main():
             fail_count += 1
             failures.append(input_stem)
             # Continue with the next pair rather than aborting the batch.
+
+        # Memory hygiene: AE accumulates leaks across sustained renders
+        # and starts crashing after N clips in a row. Forcibly quit it
+        # every `--ae-restart-every` successes so it relaunches fresh
+        # on the next osascript dispatch. 0 disables the recycle.
+        if (args.ae_restart_every > 0
+                and done_count > 0
+                and done_count % args.ae_restart_every == 0
+                and i < len(pairs_to_run)):
+            print(f"  [recycle] {done_count} clips since last AE restart — "
+                  f"quitting AE so it relaunches fresh")
+            subprocess.run(
+                ["osascript", "-e",
+                 'tell application "Adobe After Effects 2025" to quit'],
+                capture_output=True, timeout=30
+            )
+            # Wait for AE to actually exit; force-kill after 20s if hung
+            for _ in range(20):
+                if not subprocess.run(
+                    ["pgrep", "-f",
+                     "Adobe After Effects 2025.app/Contents/MacOS/After Effects"],
+                    capture_output=True
+                ).stdout:
+                    break
+                time.sleep(1)
+            else:
+                subprocess.run(
+                    ["pkill", "-9", "-f",
+                     "Adobe After Effects 2025.app/Contents/MacOS/After Effects"],
+                    capture_output=True
+                )
+                time.sleep(2)
+            print(f"  [recycle] AE quit; next clip will relaunch it")
 
     elapsed = time.time() - start
     print(
