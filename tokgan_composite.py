@@ -253,29 +253,37 @@ def transcode_to_h264(mov_path, mp4_path, crf=16, vframes=None):
     subprocess.run(cmd, check=True)
 
 
-def resample_input_to_viz_timing(input_path, viz_fps, viz_nb_frames, out_path):
-    """Re-encode the input video to viz's fps + frame count so the JSON
-    shape data (which was generated from the viz's frame sequence via
-    mp4 -> EXR -> rotobot) aligns frame-for-frame with the footage we
-    feed into AE.
+def extract_input_to_png_sequence(input_path, target_nb_frames, seq_dir):
+    """Extract the input mp4 to a CFR PNG sequence with exactly
+    target_nb_frames images, named frame_0001.png..frame_NNNN.png.
 
-    ffmpeg's `fps={viz_fps}` filter drops or duplicates frames as
-    needed; `-frames:v viz_nb_frames` trims/pads to the exact count.
-    Encoded with x264 at CRF 18 (visually lossless) using `veryfast`
-    preset since this is a throwaway intermediate.
+    PNG-sequence import avoids the AE-misreads-mp4-fps problem entirely:
+    a sequence has no container fps for AE to misinterpret, so AE
+    imports it at the comp's frame rate, one PNG per comp frame. PNG
+    is lossless so there's no generational compression loss when AE
+    re-renders.
+
+    `-vsync cfr` produces the same frame count Tokgan's mp4->EXR pipe
+    produces, which matches the JSON keyframe count.
+
+    Returns the path to frame_0001.png — pass this to AE's importFile
+    with ImportOptions.sequence=true.
     """
+    os.makedirs(seq_dir, exist_ok=True)
+    for f in os.listdir(seq_dir):
+        if f.endswith(".png"):
+            try: os.remove(os.path.join(seq_dir, f))
+            except OSError: pass
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
         "-i", input_path,
-        "-vf", f"fps={_ffmpeg_rate(viz_fps)}",
-        "-frames:v", str(viz_nb_frames),
-        "-c:v", "libx264", "-crf", "18",
-        "-pix_fmt", "yuv420p",
-        "-preset", "veryfast",
-        out_path,
+        "-vsync", "cfr",
+        "-vframes", str(target_nb_frames),
+        os.path.join(seq_dir, "frame_%04d.png"),
     ]
     print("$ " + " ".join(shlex.quote(c) for c in cmd))
     subprocess.run(cmd, check=True)
+    return os.path.join(seq_dir, "frame_0001.png")
 
 
 def relabel_viz_fps(viz_path, target_fps, out_path, target_nb_frames=None):
@@ -344,10 +352,13 @@ def composite_mode(args):
         f"{info['nb_frames']} frames = {info['duration']:.6f}s"
     )
 
-    # If a viz video is given, IT is the timing authority — the JSON
-    # shape data was generated from its frame sequence, so any drift
-    # between input fps/frames and viz fps/frames will show as
-    # shape-vs-footage misalignment. Resample the input to match viz.
+    # Comp is ALWAYS 25 fps. The JSON shape data is keyed on the CFR
+    # frame indices from Tokgan's mp4->EXR pipeline (one keyframe per
+    # source frame slot), so treating each frame as 1/25 s of comp
+    # time keeps shapes locked to footage frame-by-frame regardless
+    # of the source mp4's native fps.
+    canonical_fps = 25.0
+    canonical_nb_frames = info["nb_frames"]   # CFR count from ffprobe
     if args.viz_video:
         viz_info = ffprobe_video(args.viz_video)
         print(f"Viz video:   {args.viz_video}")
@@ -355,32 +366,21 @@ def composite_mode(args):
             f"  {viz_info['width']}x{viz_info['height']} @ "
             f"{viz_info['fps']:.6g} fps, {viz_info['nb_frames']} frames"
         )
-        if (viz_info["fps"] == info["fps"]
-                and viz_info["nb_frames"] == info["nb_frames"]):
-            print("  input already matches viz timing; no resample needed")
-            footage_path = args.input_video
-        else:
-            print("  resampling input -> viz timing")
-            # Use a stem-unique temp name so AE's session-restore on
-            # a previous clip's .aep never points at the same /tmp
-            # path that the current clip's cleanup just deleted (which
-            # would show a "missing footage" dialog and block the
-            # script).
-            footage_path = os.path.join(
-                "/tmp", f"tokgan_resampled_{input_stem}.mp4"
-            )
-            resample_input_to_viz_timing(
-                args.input_video, viz_info["fps"], viz_info["nb_frames"],
-                footage_path,
-            )
-        canonical_fps = viz_info["fps"]
+        # If viz and input disagree on CFR count, viz wins (it matches
+        # the JSON's keyframe count, since rotobot ran on the EXR
+        # sequence that produced the viz).
         canonical_nb_frames = viz_info["nb_frames"]
-        canonical_duration = viz_info["nb_frames"] / viz_info["fps"]
-    else:
-        footage_path = args.input_video
-        canonical_fps = info["fps"]
-        canonical_nb_frames = info["nb_frames"]
-        canonical_duration = info["duration"]
+    canonical_duration = canonical_nb_frames / canonical_fps
+
+    # Extract input mp4 to a PNG sequence so AE can't misread the
+    # container fps. AE will import this as a still sequence at the
+    # comp's 25 fps, one PNG = one comp frame. Stem-unique dir to
+    # survive concurrent runs / session-restore.
+    seq_dir = f"/tmp/tokgan_seq_{input_stem}"
+    footage_path = extract_input_to_png_sequence(
+        args.input_video, canonical_nb_frames, seq_dir
+    )
+    footage_is_sequence = True
 
     print(f"AE app:      {ae_app_name}")
 
@@ -431,6 +431,8 @@ def composite_mode(args):
     ]
     if args.shape_time_shift_seconds is not None:
         cmd += ["--shape-time-shift-seconds", str(args.shape_time_shift_seconds)]
+    if footage_is_sequence:
+        cmd += ["--input-is-sequence"]
     print("$ " + " ".join(shlex.quote(c) for c in cmd))
     subprocess.run(cmd, check=True)
 
@@ -458,16 +460,11 @@ def composite_mode(args):
     mov_size = os.path.getsize(mov_path)
     print(f"AE wrote {mov_path}  ({mov_size:,} bytes)")
 
-    # 4. Transcode the intermediate to H.264 mp4. The AE-side render
-    # produced canonical_nb_frames + 1 frames so the *visible* last
-    # frame has proper motion-blur sampling; -vframes trims that
-    # extra here so the output exactly matches the viz's frame count
-    # (the timing authority).
+    # 4. Transcode the intermediate to H.264 mp4. AE rendered exactly
+    # canonical_nb_frames now, no trimming needed.
     print()
-    print("--- Transcoding intermediate to H.264 mp4 (trim to "
-          f"{canonical_nb_frames} frames) ---")
-    transcode_to_h264(mov_path, mp4_path, crf=args.mp4_crf,
-                      vframes=canonical_nb_frames)
+    print("--- Transcoding intermediate to H.264 mp4 ---")
+    transcode_to_h264(mov_path, mp4_path, crf=args.mp4_crf)
 
     if not os.path.isfile(mp4_path):
         sys.exit(f"ERROR: ffmpeg returned 0 but {mp4_path} is missing.")
@@ -492,12 +489,19 @@ def composite_mode(args):
                 reclaimed += size
                 print(f"Deleted {target}  ({size:,} bytes)")
 
-    # Also delete the resampled-input temp file if we created one
-    if args.viz_video and footage_path.startswith("/tmp/") and os.path.isfile(footage_path):
-        size = os.path.getsize(footage_path)
-        os.remove(footage_path)
-        reclaimed += size
-        print(f"Deleted {footage_path}  ({size:,} bytes, resampled input)")
+    # Delete the PNG sequence dir we extracted from the input mp4.
+    # These can be 100s of MB per clip and we don't want them sticking
+    # around (also so a future session-restored .aep doesn't point at
+    # a stale dir).
+    if footage_is_sequence and seq_dir.startswith("/tmp/") and os.path.isdir(seq_dir):
+        seq_size = sum(
+            os.path.getsize(os.path.join(seq_dir, f))
+            for f in os.listdir(seq_dir)
+            if os.path.isfile(os.path.join(seq_dir, f))
+        )
+        shutil.rmtree(seq_dir, ignore_errors=True)
+        reclaimed += seq_size
+        print(f"Deleted {seq_dir}  ({seq_size:,} bytes, PNG sequence)")
 
     print(f"Reclaimed {reclaimed:,} bytes")
     print()

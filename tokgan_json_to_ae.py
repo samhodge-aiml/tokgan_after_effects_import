@@ -230,13 +230,13 @@ def build_shape_record(obj_name, obj, height, start_frame, end_frame, fps,
                 raw.append((_t(seg_start - 1), 0))
             raw.append((_t(seg_start), 100))
             raw.append((_t(seg_end), 100))
-            # Always emit the trailing off-frame so opacity drops to 0
-            # at seg_end + 1. With --shape-time-shift -2 the off-frame
-            # lands cleanly within the rendered range instead of right
-            # at the comp boundary, so we no longer need the earlier
-            # "skip trailing off for the final segment" hack.
-            if seg_end < end_frame:
-                raw.append((_t(seg_end + 1), 0))
+            # Always emit the trailing off-key (even when seg_end ==
+            # end_frame). The comp can extend past the JSON's last
+            # frame (e.g. when the input mp4's CFR count > JSON max),
+            # and without the off-key the shape's opacity would stay
+            # at 100 indefinitely and hold the shape visible through
+            # the rest of the comp.
+            raw.append((_t(seg_end + 1), 0))
         if segments[0][0] > start_frame and not any(t == 0.0 for t, _ in raw):
             raw.append((0.0, 0))
 
@@ -375,8 +375,24 @@ LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
             }}
             STEP = "composite-import-footage (" + data.inputVideo + ")";
             var footFile = new File(data.inputVideo);
-            if (!footFile.exists) throw new Error("Input video not found: " + data.inputVideo);
-            var foot = app.project.importFile(new ImportOptions(footFile));
+            if (!footFile.exists) throw new Error("Input footage not found: " + data.inputVideo);
+            var importOpts = new ImportOptions(footFile);
+            if (data.inputIsSequence) {{
+                // Image sequence: AE picks up all sibling
+                // frame_NNNN.png files as one FootageItem.
+                importOpts.sequence = true;
+            }}
+            var foot = app.project.importFile(importOpts);
+            if (data.inputIsSequence) {{
+                // AE's default Sequence Footage Frame Rate prefs is
+                // usually 30 fps — that would make the imported
+                // sequence play at 30 fps inside our 25 fps comp and
+                // drift the footage off the JSON shape timing. Force
+                // the footage's interpreted frame rate to match the
+                // comp.
+                foot.mainSource.conformFrameRate = data.fps;
+                $.writeln("[Tokgan] conformed sequence to " + data.fps + " fps");
+            }}
             STEP = "composite-create-comp";
             comp = app.project.items.addComp(
                 "TokganComposite",
@@ -566,24 +582,17 @@ LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
 
             if (typeof data.nbFrames === "number" && data.nbFrames > 0) {{
                 STEP = "auto-render-time-span";
-                // Render ONE extra frame past the user-visible target.
-                // ffmpeg trims it in the transcode step. Rationale:
-                // motion blur on AE's last rendered frame samples the
-                // exposure window [t-0.5/fps, t+0.5/fps]; the post-
-                // frame half needs a "future" keyframe to interpolate
-                // against, otherwise the shape (and footage) freeze
-                // for the back half of the window, producing weak /
-                // asymmetric blur on the final frame. By rendering
-                // N+1 frames and trimming the last in transcode, the
-                // surviving N frames each have proper bidirectional
-                // motion-blur sampling.
+                // Render exactly nbFrames. With the footage now
+                // conformed to comp fps via mainSource.conformFrameRate
+                // the per-frame timing is correct, so we no longer
+                // need the N+1 render + ffmpeg trim "future-data" hack
+                // that was previously masking the fps mismatch.
                 rqItem.timeSpanStart = 0;
-                rqItem.timeSpanDuration = (data.nbFrames + 1) / comp.frameRate;
+                rqItem.timeSpanDuration = data.nbFrames / comp.frameRate;
                 $.writeln(
                     "[Tokgan] timeSpan set to " +
                     rqItem.timeSpanDuration.toFixed(6) +
-                    "s (render " + (data.nbFrames + 1) +
-                    " frames, ffmpeg will trim to " + data.nbFrames + ")"
+                    "s (render " + data.nbFrames + " frames)"
                 );
             }}
 
@@ -727,7 +736,19 @@ def main():
             "correctly centred motion blur, and save the project to "
             "<out_jsx_stem>.aep so a future headless aerender run can "
             "pick it up. Without this flag the loader keeps its "
-            "shape-layer-only behaviour."
+            "shape-layer-only behaviour. Can also point to the first "
+            "file of a PNG image sequence (combine with --input-is-sequence)."
+        ),
+    )
+    p.add_argument(
+        "--input-is-sequence",
+        action="store_true",
+        help=(
+            "When --input-video points to an image sequence (e.g. the "
+            "first frame_NNNN.png), tell AE to import it with "
+            "ImportOptions.sequence=true so all numbered frames are "
+            "loaded as one footage item at the comp's frame rate. "
+            "This avoids AE misreading the container fps on mp4 inputs."
         ),
     )
     p.add_argument(
@@ -990,6 +1011,7 @@ def main():
 
         if args.input_video:
             payload["inputVideo"] = os.path.abspath(args.input_video)
+            payload["inputIsSequence"] = bool(args.input_is_sequence)
             payload["shutterAngle"] = float(args.shutter_angle)
             payload["shutterPhase"] = float(args.shutter_phase)
             payload["aepPath"] = os.path.abspath(
