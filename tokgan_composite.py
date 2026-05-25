@@ -382,6 +382,17 @@ def composite_mode(args):
     )
     footage_is_sequence = True
 
+    # Belt-and-suspenders: register the PNG dir for deletion at
+    # interpreter exit, so a Python crash / AE failure / SIGTERM
+    # doesn't leave 100s of MB lying in /tmp. The explicit cleanup
+    # near the end still runs on success path; this just makes the
+    # error path safe too.
+    import atexit
+    def _cleanup_seq_dir(path=seq_dir):
+        if path.startswith("/tmp/") and os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+    atexit.register(_cleanup_seq_dir)
+
     print(f"AE app:      {ae_app_name}")
 
     out_dir = args.output_dir or os.path.dirname(os.path.abspath(args.json))
